@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
+from django.urls import reverse
+from rest_framework.test import APITestCase
 
 from books.models import Book
 from books.serializers import BookSerializer
@@ -115,3 +117,107 @@ class BookSerializerTests(SimpleTestCase):
         self.assertTrue(serializer.fields['id'].read_only)
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertNotIn('id', serializer.validated_data)
+
+
+class BookAPITests(APITestCase):
+    def setUp(self):
+        self.payload = {
+            'title': 'Book',
+            'author': 'Author',
+            'cover': 'HARD',
+            'inventory': 1,
+            'daily_fee': '1.50',
+        }
+        self.book = Book.objects.create(**self.payload)
+        self.list_url = reverse('book-list')
+        self.detail_url = reverse('book-detail', args=[self.book.pk])
+
+    def test_create_book(self):
+        response = self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Book.objects.count(), 2)
+        created = Book.objects.get(pk=response.data['id'])
+        self.assertNotEqual(created.pk, self.book.pk)
+        self.assertEqual(response.data, {'id': created.pk, **self.payload})
+        self.assertEqual(created.title, self.payload['title'])
+        self.assertEqual(created.author, self.payload['author'])
+        self.assertEqual(created.cover, self.payload['cover'])
+        self.assertEqual(created.inventory, self.payload['inventory'])
+        self.assertEqual(created.daily_fee, Decimal('1.50'))
+
+    def test_list_books(self):
+        second_payload = {**self.payload, 'title': 'Second book', 'cover': 'SOFT'}
+        second = Book.objects.create(**second_payload)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertCountEqual(response.data, [
+            {'id': self.book.pk, **self.payload},
+            {'id': second.pk, **second_payload},
+        ])
+
+    def test_retrieve_book(self):
+        response = self.client.get(self.detail_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'id': self.book.pk, **self.payload})
+
+    def test_missing_book_returns_404(self):
+        url = reverse('book-detail', args=[self.book.pk + 1])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+    def test_update_book(self):
+        payload = {
+            'title': 'Updated book',
+            'author': 'Updated author',
+            'cover': 'SOFT',
+            'inventory': 3,
+            'daily_fee': '2.75',
+        }
+        response = self.client.put(self.detail_url, payload, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'id': self.book.pk, **payload})
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.title, payload['title'])
+        self.assertEqual(self.book.author, payload['author'])
+        self.assertEqual(self.book.cover, payload['cover'])
+        self.assertEqual(self.book.inventory, payload['inventory'])
+        self.assertEqual(self.book.daily_fee, Decimal('2.75'))
+
+    def test_partial_update_preserves_other_fields(self):
+        response = self.client.patch(self.detail_url, {'inventory': 0}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 0)
+        self.assertEqual(self.book.title, self.payload['title'])
+        self.assertEqual(self.book.author, self.payload['author'])
+        self.assertEqual(self.book.cover, self.payload['cover'])
+        self.assertEqual(self.book.daily_fee, Decimal('1.50'))
+
+    def test_delete_book(self):
+        response = self.client.delete(self.detail_url)
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b'')
+        self.assertFalse(Book.objects.filter(pk=self.book.pk).exists())
+
+    def test_invalid_payload_returns_field_errors(self):
+        for field, value in (
+            ('inventory', -1),
+            ('daily_fee', '-0.01'),
+            ('cover', 'INVALID'),
+        ):
+            with self.subTest(field=field):
+                response = self.client.post(
+                    self.list_url, {**self.payload, field: value}, format='json',
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(set(response.data), {field})
+                self.assertEqual(Book.objects.count(), 1)
+
+    def test_route_paths(self):
+        self.assertEqual(self.list_url, '/books/')
+        self.assertEqual(self.detail_url, f'/books/{self.book.pk}/')
+
+    def test_browsable_api_renders(self):
+        response = self.client.get(self.list_url, HTTP_ACCEPT='text/html')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('text/html', response['Content-Type'])
