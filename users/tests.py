@@ -12,7 +12,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from users.models import User
 from users.serializers import UserProfileSerializer, UserRegistrationSerializer
-from users.views import UserRegistrationView
+from users.views import CurrentUserView, UserRegistrationView
 
 
 class UserTests(TestCase):
@@ -319,7 +319,7 @@ class UserRegistrationAPITests(APITestCase):
                     response = getattr(self.client, method)(path)
                     self.assertEqual(response.status_code, 405)
         for path in (
-            '/users/1/', '/users/me/', '/users/logout/', '/users/token/verify/',
+            '/users/1/', '/users/logout/', '/users/token/verify/',
         ):
             with self.subTest(path=path), self.assertRaises(Resolver404):
                 resolve(path)
@@ -350,7 +350,7 @@ class UserJWTAPITests(APITestCase):
         self.assertEqual(str(new_access['user_id']), str(self.user.pk))
         self.assertEqual(api_settings.DEFAULT_AUTHENTICATION_CLASSES, [JWTAuthentication])
         request = APIRequestFactory().get(
-            '/users/', HTTP_AUTHORIZATION=f"Bearer {refreshed.data['access']}",
+            '/users/', HTTP_AUTHORIZE=f"Bearer {refreshed.data['access']}",
         )
         authenticated_user, _ = JWTAuthentication().authenticate(request)
         self.assertEqual(authenticated_user, self.user)
@@ -373,7 +373,108 @@ class UserJWTAPITests(APITestCase):
         }, format='json')
         self.assertEqual(invalid_refresh.status_code, 401)
         request = APIRequestFactory().get(
-            '/users/', HTTP_AUTHORIZATION=f"Bearer {response.data['refresh']}",
+            '/users/', HTTP_AUTHORIZE=f"Bearer {response.data['refresh']}",
         )
         with self.assertRaises(InvalidToken):
             JWTAuthentication().authenticate(request)
+
+
+class CurrentUserAPITests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='current@example.com', password='profile-test-password',
+            first_name='Current', last_name='Reader',
+        )
+        self.other = User.objects.create_user(
+            email='reader@example.com', password='other-test-password',
+            first_name='Other', last_name='User',
+        )
+        response = self.client.post(reverse('token-obtain-pair'), {
+            'email': self.user.email, 'password': 'profile-test-password',
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.access = response.data['access']
+        self.client.credentials(HTTP_AUTHORIZE=f'Bearer {self.access}')
+        self.url = reverse('user-me')
+
+    def test_custom_header_get_returns_only_current_user_profile(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {
+            'id': self.user.pk,
+            'email': 'current@example.com',
+            'first_name': 'Current',
+            'last_name': 'Reader',
+            'is_staff': False,
+        })
+
+    def test_missing_invalid_or_standard_header_cannot_access_profile(self):
+        for credentials in (
+            {},
+            {'HTTP_AUTHORIZATION': f'Bearer {self.access}'},
+            {'HTTP_AUTHORIZE': 'Bearer invalid-token'},
+        ):
+            for method in ('get', 'put', 'patch'):
+                with self.subTest(headers=tuple(credentials), method=method):
+                    self.client.credentials(**credentials)
+                    response = getattr(self.client, method)(self.url)
+                    self.assertEqual(response.status_code, 401)
+
+    def test_put_updates_only_current_user_and_normalizes_email(self):
+        password_hash = self.user.password
+        response = self.client.put(self.url, {
+            'id': self.other.pk,
+            'email': 'Other@EXAMPLE.COM',
+            'first_name': 'Updated',
+            'last_name': 'Name',
+            'is_staff': True,
+            'password': 'ignored-new-password',
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.other.refresh_from_db()
+        self.assertEqual(response.data, {
+            'id': self.user.pk, 'email': 'Other@example.com',
+            'first_name': 'Updated', 'last_name': 'Name', 'is_staff': False,
+        })
+        self.assertEqual(self.user.email, 'Other@example.com')
+        self.assertEqual(self.user.first_name, 'Updated')
+        self.assertEqual(self.user.last_name, 'Name')
+        self.assertFalse(self.user.is_staff)
+        self.assertEqual(self.user.password, password_hash)
+        self.assertTrue(self.user.check_password('profile-test-password'))
+        self.assertEqual(self.other.email, 'reader@example.com')
+        self.assertEqual(self.other.first_name, 'Other')
+        self.assertEqual(self.other.last_name, 'User')
+
+    def test_patch_preserves_omitted_fields(self):
+        password_hash = self.user.password
+        response = self.client.patch(self.url, {'first_name': 'New name'}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.first_name, 'New name')
+        self.assertEqual(self.user.email, 'current@example.com')
+        self.assertEqual(self.user.last_name, 'Reader')
+        self.assertFalse(self.user.is_staff)
+        self.assertEqual(self.user.password, password_hash)
+
+    def test_normalized_duplicate_email_returns_400_without_update(self):
+        response = self.client.patch(
+            self.url, {'email': 'reader@EXAMPLE.COM'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(set(response.data), {'email'})
+        self.assertEqual(response.data['email'][0].code, 'unique')
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, 'current@example.com')
+        self.assertEqual(User.objects.count(), 2)
+
+    def test_current_user_route_does_not_support_create_or_delete(self):
+        self.assertEqual(self.url, '/users/me/')
+        self.assertIs(resolve(self.url).func.view_class, CurrentUserView)
+        for method in ('post', 'delete'):
+            with self.subTest(method=method):
+                response = getattr(self.client, method)(self.url)
+                self.assertEqual(response.status_code, 405)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertEqual(User.objects.count(), 2)

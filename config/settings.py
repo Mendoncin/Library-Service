@@ -44,6 +44,10 @@ INSTALLED_APPS = [
 
 AUTH_USER_MODEL = 'users.User'
 
+SIMPLE_JWT = {
+    'AUTH_HEADER_NAME': 'HTTP_AUTHORIZE',
+}
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
