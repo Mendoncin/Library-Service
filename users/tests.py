@@ -2,9 +2,17 @@ from django.contrib.auth import authenticate, get_user_model
 from django.core.exceptions import FieldDoesNotExist
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.urls import Resolver404, resolve, reverse
+from rest_framework.settings import api_settings
+from rest_framework.test import APIRequestFactory, APITestCase
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework_simplejwt.exceptions import InvalidToken
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from users.models import User
 from users.serializers import UserProfileSerializer, UserRegistrationSerializer
+from users.views import UserRegistrationView
 
 
 class UserTests(TestCase):
@@ -254,3 +262,118 @@ class UserProfileSerializerTests(TestCase):
         serializer.save()
         user.refresh_from_db()
         self.assertEqual(user.email, 'Reader@example.com')
+
+
+class UserRegistrationAPITests(APITestCase):
+    def test_public_registration_creates_regular_user(self):
+        payload = {
+            'email': 'Reader@EXAMPLE.COM',
+            'first_name': 'Reader',
+            'last_name': 'Example',
+            'password': 'registration-test-password',
+            'is_staff': True,
+            'is_superuser': True,
+        }
+        response = self.client.post(reverse('user-register'), payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(User.objects.count(), 1)
+        user = User.objects.get(email='Reader@example.com')
+        self.assertEqual(user.first_name, payload['first_name'])
+        self.assertEqual(user.last_name, payload['last_name'])
+        self.assertNotEqual(user.password, payload['password'])
+        self.assertTrue(user.check_password(payload['password']))
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.is_superuser)
+        self.assertEqual(response.data, {
+            'email': 'Reader@example.com',
+            'first_name': 'Reader',
+            'last_name': 'Example',
+        })
+
+    def test_invalid_registration_returns_email_errors(self):
+        User.objects.create_user('reader@example.com', 'test-password')
+        for email_data in (
+            {'email': 'reader@EXAMPLE.COM'},
+            {'email': 'invalid-email'},
+            {},
+        ):
+            with self.subTest(email_data=email_data):
+                response = self.client.post(reverse('user-register'), {
+                    **email_data, 'password': 'registration-test-password',
+                }, format='json')
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(set(response.data), {'email'})
+                self.assertEqual(User.objects.count(), 1)
+
+    def test_routes_expose_only_requested_user_operations(self):
+        routes = (
+            ('user-register', '/users/', UserRegistrationView),
+            ('token-obtain-pair', '/users/token/', TokenObtainPairView),
+            ('token-refresh', '/users/token/refresh/', TokenRefreshView),
+        )
+        for name, path, view in routes:
+            with self.subTest(path=path):
+                self.assertEqual(reverse(name), path)
+                self.assertIs(resolve(path).func.view_class, view)
+                for method in ('get', 'put', 'patch', 'delete'):
+                    response = getattr(self.client, method)(path)
+                    self.assertEqual(response.status_code, 405)
+        for path in (
+            '/users/1/', '/users/me/', '/users/logout/', '/users/token/verify/',
+        ):
+            with self.subTest(path=path), self.assertRaises(Resolver404):
+                resolve(path)
+
+
+class UserJWTAPITests(APITestCase):
+    def setUp(self):
+        self.credentials = {
+            'email': 'reader@example.com', 'password': 'jwt-test-password',
+        }
+        self.user = User.objects.create_user(**self.credentials)
+
+    def test_email_credentials_obtain_tokens_and_refresh_access(self):
+        response = self.client.post(
+            reverse('token-obtain-pair'), self.credentials, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {'access', 'refresh'})
+        self.assertTrue(response.data['access'])
+        self.assertTrue(response.data['refresh'])
+        access = AccessToken(response.data['access'])
+        self.assertEqual(str(access['user_id']), str(self.user.pk))
+        refreshed = self.client.post(reverse('token-refresh'), {
+            'refresh': response.data['refresh'],
+        }, format='json')
+        self.assertEqual(refreshed.status_code, 200)
+        new_access = AccessToken(refreshed.data['access'])
+        self.assertEqual(str(new_access['user_id']), str(self.user.pk))
+        self.assertEqual(api_settings.DEFAULT_AUTHENTICATION_CLASSES, [JWTAuthentication])
+        request = APIRequestFactory().get(
+            '/users/', HTTP_AUTHORIZATION=f"Bearer {refreshed.data['access']}",
+        )
+        authenticated_user, _ = JWTAuthentication().authenticate(request)
+        self.assertEqual(authenticated_user, self.user)
+
+    def test_incorrect_password_is_rejected(self):
+        response = self.client.post(reverse('token-obtain-pair'), {
+            **self.credentials, 'password': 'incorrect-password',
+        }, format='json')
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn('access', response.data)
+        self.assertNotIn('refresh', response.data)
+
+    def test_token_types_are_not_interchangeable(self):
+        response = self.client.post(
+            reverse('token-obtain-pair'), self.credentials, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        invalid_refresh = self.client.post(reverse('token-refresh'), {
+            'refresh': response.data['access'],
+        }, format='json')
+        self.assertEqual(invalid_refresh.status_code, 401)
+        request = APIRequestFactory().get(
+            '/users/', HTTP_AUTHORIZATION=f"Bearer {response.data['refresh']}",
+        )
+        with self.assertRaises(InvalidToken):
+            JWTAuthentication().authenticate(request)
