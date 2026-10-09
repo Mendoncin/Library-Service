@@ -5,7 +5,6 @@ from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase
-from rest_framework_simplejwt.tokens import AccessToken
 
 from books.models import Book
 from books.serializers import BookSerializer
@@ -123,12 +122,18 @@ class BookSerializerTests(SimpleTestCase):
 
 class BookAPITests(APITestCase):
     def setUp(self):
-        staff = get_user_model().objects.create_user(
-            email='staff@example.com', is_staff=True,
+        credentials = {'email': 'staff@example.com', 'password': 'books-test-password'}
+        self.staff = get_user_model().objects.create_user(
+            **credentials, is_staff=True, is_superuser=False,
         )
-        self.assertTrue(staff.is_staff)
-        self.assertFalse(staff.is_superuser)
-        access = AccessToken.for_user(staff)
+        self.assertTrue(self.staff.is_staff)
+        self.assertFalse(self.staff.is_superuser)
+        response = self.client.post(
+            reverse('token-obtain-pair'), credentials, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        access = response.data['access']
+        self.assertTrue(access)
         self.client.credentials(HTTP_AUTHORIZE=f'Bearer {access}')
         self.payload = {
             'title': 'Book',
@@ -144,6 +149,7 @@ class BookAPITests(APITestCase):
     def test_create_book(self):
         response = self.client.post(self.list_url, self.payload, format='json')
         self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.renderer_context['request'].user, self.staff)
         self.assertEqual(Book.objects.count(), 2)
         created = Book.objects.get(pk=response.data['id'])
         self.assertNotEqual(created.pk, self.book.pk)
@@ -246,9 +252,15 @@ class BookPermissionAPITests(APITestCase):
         self.detail_url = reverse('book-detail', args=[self.book.pk])
 
     def authenticate_regular_user(self):
-        user = get_user_model().objects.create_user(email='reader@example.com')
+        credentials = {'email': 'reader@example.com', 'password': 'books-test-password'}
+        user = get_user_model().objects.create_user(**credentials)
         self.assertFalse(user.is_staff)
-        access = AccessToken.for_user(user)
+        response = self.client.post(
+            reverse('token-obtain-pair'), credentials, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        access = response.data['access']
+        self.assertTrue(access)
         self.client.credentials(HTTP_AUTHORIZE=f'Bearer {access}')
         return user
 
