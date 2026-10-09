@@ -1,9 +1,11 @@
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import AccessToken
 
 from books.models import Book
 from books.serializers import BookSerializer
@@ -121,6 +123,13 @@ class BookSerializerTests(SimpleTestCase):
 
 class BookAPITests(APITestCase):
     def setUp(self):
+        staff = get_user_model().objects.create_user(
+            email='staff@example.com', is_staff=True,
+        )
+        self.assertTrue(staff.is_staff)
+        self.assertFalse(staff.is_superuser)
+        access = AccessToken.for_user(staff)
+        self.client.credentials(HTTP_AUTHORIZE=f'Bearer {access}')
         self.payload = {
             'title': 'Book',
             'author': 'Author',
@@ -221,3 +230,69 @@ class BookAPITests(APITestCase):
         response = self.client.get(self.list_url, HTTP_ACCEPT='text/html')
         self.assertEqual(response.status_code, 200)
         self.assertIn('text/html', response['Content-Type'])
+
+
+class BookPermissionAPITests(APITestCase):
+    def setUp(self):
+        self.payload = {
+            'title': 'Book',
+            'author': 'Author',
+            'cover': 'HARD',
+            'inventory': 1,
+            'daily_fee': '1.50',
+        }
+        self.book = Book.objects.create(**self.payload)
+        self.list_url = reverse('book-list')
+        self.detail_url = reverse('book-detail', args=[self.book.pk])
+
+    def authenticate_regular_user(self):
+        user = get_user_model().objects.create_user(email='reader@example.com')
+        self.assertFalse(user.is_staff)
+        access = AccessToken.for_user(user)
+        self.client.credentials(HTTP_AUTHORIZE=f'Bearer {access}')
+        return user
+
+    def assert_writes_denied(self, expected_status):
+        original_books = list(Book.objects.order_by('pk').values())
+        changed_payload = {**self.payload, 'title': 'Changed book', 'inventory': 5}
+        for method, url, payload in (
+            ('post', self.list_url, changed_payload),
+            ('put', self.detail_url, changed_payload),
+            ('patch', self.detail_url, {'inventory': 5}),
+            ('delete', self.detail_url, None),
+        ):
+            with self.subTest(method=method):
+                response = getattr(self.client, method)(url, payload, format='json')
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(
+                    list(Book.objects.order_by('pk').values()), original_books,
+                )
+
+    def test_anonymous_can_list_books(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [{'id': self.book.pk, **self.payload}])
+
+    def test_anonymous_can_retrieve_book(self):
+        response = self.client.get(self.detail_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'id': self.book.pk, **self.payload})
+
+    def test_regular_user_can_read_books_with_jwt(self):
+        user = self.authenticate_regular_user()
+        for url, expected in (
+            (self.list_url, [{'id': self.book.pk, **self.payload}]),
+            (self.detail_url, {'id': self.book.pk, **self.payload}),
+        ):
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, expected)
+                self.assertEqual(response.renderer_context['request'].user, user)
+
+    def test_anonymous_cannot_write_books(self):
+        self.assert_writes_denied(401)
+
+    def test_regular_user_cannot_write_books(self):
+        self.authenticate_regular_user()
+        self.assert_writes_denied(403)
