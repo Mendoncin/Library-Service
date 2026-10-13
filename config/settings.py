@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'books.apps.BooksConfig',
     'users.apps.UsersConfig',
+    'borrowings.apps.BorrowingsConfig',
 ]
 
 AUTH_USER_MODEL = 'users.User'
