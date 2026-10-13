@@ -1,5 +1,6 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -7,12 +8,13 @@ from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.test import TestCase
 from django.urls import resolve, reverse
+from rest_framework.exceptions import ValidationError as SerializerValidationError
 from rest_framework.test import APITestCase
 
 from books.models import Book
 from books.serializers import BookSerializer
 from borrowings.models import Borrowing
-from borrowings.serializers import BorrowingSerializer
+from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
 from borrowings.urls import urlpatterns
 from borrowings.views import BorrowingViewSet
 
@@ -217,3 +219,151 @@ class BorrowingReadTests(APITestCase):
                 self.assertIs(match.func.cls, BorrowingViewSet)
                 self.assertEqual(match.func.actions['get'], action)
                 self.assertLessEqual(set(match.func.actions), {'get', 'head'})
+
+
+class BorrowingCreateSerializerTests(TestCase):
+    def setUp(self):
+        self.today = date(2026, 10, 13)
+        date_patch = patch('borrowings.serializers.timezone.localdate', return_value=self.today)
+        self.localdate = date_patch.start()
+        self.addCleanup(date_patch.stop)
+        self.book = Book.objects.create(
+            title='Book',
+            author='Author',
+            cover=Book.Cover.HARD,
+            inventory=2,
+            daily_fee=Decimal('2.50'),
+        )
+        self.user = get_user_model().objects.create_user(email='reader@example.com')
+        self.payload = {
+            'book': self.book.pk,
+            'expected_return_date': (self.today + timedelta(days=7)).isoformat(),
+        }
+
+    def test_serializer_exposes_only_create_fields(self):
+        serializer = BorrowingCreateSerializer()
+        self.assertEqual(set(serializer.fields), {'id', 'book', 'expected_return_date'})
+        self.assertTrue(serializer.fields['id'].read_only)
+        for name in ('book', 'expected_return_date'):
+            with self.subTest(field=name):
+                self.assertFalse(serializer.fields[name].read_only)
+                self.assertTrue(serializer.fields[name].required)
+
+    def test_valid_creation_persists_borrowing_and_decreases_inventory(self):
+        serializer = BorrowingCreateSerializer(data=self.payload)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        borrowing = serializer.save(user=self.user)
+        borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertEqual(Borrowing.objects.count(), 1)
+        self.assertEqual(borrowing.book, self.book)
+        self.assertEqual(borrowing.user, self.user)
+        self.assertEqual(borrowing.borrow_date, self.today)
+        self.assertEqual(borrowing.expected_return_date, self.today + timedelta(days=7))
+        self.assertIsNone(borrowing.actual_return_date)
+        self.assertEqual(self.book.inventory, 1)
+        self.assertEqual(serializer.data, {'id': borrowing.pk, **self.payload})
+
+    def test_zero_inventory_is_rejected_during_validation(self):
+        Book.objects.filter(pk=self.book.pk).update(inventory=0)
+        serializer = BorrowingCreateSerializer(data=self.payload)
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(serializer.errors, {'book': ['This book is out of stock.']})
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 0)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_inventory_exhausted_after_validation_is_rejected_on_save(self):
+        Book.objects.filter(pk=self.book.pk).update(inventory=1)
+        serializer = BorrowingCreateSerializer(data=self.payload)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        Book.objects.filter(pk=self.book.pk).update(inventory=0)
+        with self.assertRaises(SerializerValidationError) as caught:
+            serializer.save(user=self.user)
+        self.assertEqual(caught.exception.detail, {'book': 'This book is out of stock.'})
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 0)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_insert_failure_rolls_back_inventory_decrement(self):
+        serializer = BorrowingCreateSerializer(data=self.payload)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        with self.assertRaises(IntegrityError):
+            serializer.save()
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_expected_return_before_today_is_rejected(self):
+        serializer = BorrowingCreateSerializer(data={
+            **self.payload,
+            'expected_return_date': (self.today - timedelta(days=1)).isoformat(),
+        })
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(serializer.errors, {
+            'expected_return_date': ['Expected return date cannot be before today.'],
+        })
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_expected_return_today_is_valid(self):
+        serializer = BorrowingCreateSerializer(data={
+            **self.payload, 'expected_return_date': self.today.isoformat(),
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        borrowing = serializer.save(user=self.user)
+        borrowing.refresh_from_db()
+        self.assertEqual(borrowing.expected_return_date, borrowing.borrow_date)
+        self.assertEqual(borrowing.borrow_date, self.today)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 1)
+
+    def test_missing_book_is_rejected(self):
+        serializer = BorrowingCreateSerializer(data={**self.payload, 'book': self.book.pk + 1})
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(set(serializer.errors), {'book'})
+        self.assertEqual(serializer.errors['book'][0].code, 'does_not_exist')
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_payload_cannot_control_server_fields(self):
+        other_user = get_user_model().objects.create_user(email='other@example.com')
+        serializer = BorrowingCreateSerializer(data={
+            **self.payload,
+            'id': 999,
+            'user': other_user.pk,
+            'borrow_date': '2020-01-01',
+            'actual_return_date': self.today.isoformat(),
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(set(serializer.validated_data), {'book', 'expected_return_date'})
+        borrowing = serializer.save(user=self.user)
+        borrowing.refresh_from_db()
+        self.assertNotEqual(borrowing.pk, 999)
+        self.assertEqual(borrowing.user, self.user)
+        self.assertEqual(borrowing.borrow_date, self.today)
+        self.assertIsNone(borrowing.actual_return_date)
+
+    def test_date_change_after_validation_is_rejected_before_decrement(self):
+        serializer = BorrowingCreateSerializer(data={
+            **self.payload, 'expected_return_date': self.today.isoformat(),
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.localdate.return_value = self.today + timedelta(days=1)
+        with self.assertRaises(SerializerValidationError) as caught:
+            serializer.save(user=self.user)
+        self.assertEqual(caught.exception.detail, {
+            'expected_return_date': 'Expected return date cannot be before today.',
+        })
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
+
+    def test_book_and_expected_return_date_are_required(self):
+        serializer = BorrowingCreateSerializer(data={})
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(set(serializer.errors), {'book', 'expected_return_date'})
+        for errors in serializer.errors.values():
+            self.assertEqual(errors[0].code, 'required')
