@@ -22,6 +22,21 @@ class BorrowingViewSet(
             queryset = queryset.filter(user=self.request.user)
 
         if self.action == 'list':
+            if self.request.user.is_staff:
+                raw_user_id = self.request.query_params.get('user_id', '')
+                if raw_user_id:
+                    digits = raw_user_id.lstrip('0')
+                    if (
+                        not raw_user_id.isascii()
+                        or not raw_user_id.isdigit()
+                        or len(digits) > 19
+                        or not 0 < int(digits or '0') <= 2**63 - 1
+                    ):
+                        raise ValidationError({
+                            'user_id': ['Expected a positive integer user id within the 64-bit range.'],
+                        })
+                    queryset = queryset.filter(user_id=int(digits))
+
             is_active = self.request.query_params.get('is_active', '').lower()
             if is_active in ('true', 'false'):
                 queryset = queryset.filter(actual_return_date__isnull=is_active == 'true')
