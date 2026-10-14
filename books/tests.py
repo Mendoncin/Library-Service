@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -8,6 +9,7 @@ from rest_framework.test import APITestCase
 
 from books.models import Book
 from books.serializers import BookSerializer
+from borrowings.models import Borrowing
 
 
 class BookValidationTests(SimpleTestCase):
@@ -213,6 +215,23 @@ class BookAPITests(APITestCase):
         self.assertEqual(response.status_code, 204)
         self.assertEqual(response.content, b'')
         self.assertFalse(Book.objects.filter(pk=self.book.pk).exists())
+
+    def test_delete_protected_book_returns_conflict_without_deleting_records(self):
+        reader = get_user_model().objects.create_user(email='reader@example.com')
+        borrowing = Borrowing.objects.create(
+            book=self.book,
+            user=reader,
+            borrow_date=date(2026, 10, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+        response = self.client.delete(self.detail_url)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {
+            'detail': 'This book cannot be deleted because it has related borrowings.',
+        })
+        self.assertEqual(response.renderer_context['request'].user, self.staff)
+        self.assertTrue(Book.objects.filter(pk=self.book.pk).exists())
+        self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
 
     def test_invalid_payload_returns_field_errors(self):
         for field, value in (
