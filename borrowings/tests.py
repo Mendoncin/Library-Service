@@ -357,6 +357,132 @@ class BorrowingReadTests(APITestCase):
                 )
                 self.assertEqual(response.status_code, 404)
 
+    def test_staff_filters_borrowings_by_user_id(self):
+        self.authenticate_staff()
+        for user, expected, excluded in (
+            (self.user_a, self.borrowings[:2], self.borrowings[2:]),
+            (self.user_b, self.borrowings[2:], self.borrowings[:2]),
+        ):
+            for value in (str(user.pk), f'0{user.pk}'):
+                with self.subTest(user_id=value):
+                    response = self.client.get(self.list_url, {'user_id': value})
+                    self.assertEqual(response.status_code, 200)
+                    ids = [item['id'] for item in response.data]
+                    self.assertEqual(ids, [borrowing.pk for borrowing in expected])
+                    for borrowing in excluded:
+                        self.assertNotIn(borrowing.pk, ids)
+
+    def test_staff_nonexistent_user_id_returns_empty_list(self):
+        self.authenticate_staff()
+        missing_id = 2**63 - 1
+        self.assertFalse(get_user_model().objects.filter(pk=missing_id).exists())
+        response = self.client.get(self.list_url, {'user_id': missing_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+
+    def test_staff_empty_user_id_matches_unfiltered_list(self):
+        self.authenticate_staff()
+        response = self.client.get(self.list_url, {'user_id': ''})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, self.client.get(self.list_url).data)
+        self.assertEqual(
+            [item['id'] for item in response.data],
+            [borrowing.pk for borrowing in self.borrowings],
+        )
+
+    def test_staff_invalid_user_id_returns_field_error(self):
+        self.authenticate_staff()
+        for value in (
+            'abc', '1.5', '0', '-1', '+5', '²', '9223372036854775808',
+            ' 5', '5 ', '1_0', '9' * 5000,
+        ):
+            with self.subTest(user_id=value):
+                response = self.client.get(self.list_url, {'user_id': value})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), {
+                    'user_id': ['Expected a positive integer user id within the 64-bit range.'],
+                })
+
+    def test_normal_user_ignores_user_id(self):
+        self.authenticate(self.user_a)
+        for value in (self.user_b.pk, self.user_a.pk, 'abc', '9223372036854775808'):
+            with self.subTest(user_id=value):
+                response = self.client.get(self.list_url, {'user_id': value})
+                self.assertEqual(response.status_code, 200)
+                ids = [item['id'] for item in response.data]
+                self.assertEqual(ids, [borrowing.pk for borrowing in self.borrowings[:2]])
+                for borrowing in self.borrowings[2:]:
+                    self.assertNotIn(borrowing.pk, ids)
+
+    def test_user_detail_ignores_user_id_and_preserves_visibility(self):
+        self.authenticate(self.user_a)
+        for value in (self.user_b.pk, 'abc'):
+            with self.subTest(user_id=value):
+                response = self.client.get(self.detail_url, {'user_id': value})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, BorrowingSerializer(self.borrowing).data)
+                response = self.client.get(
+                    reverse('borrowing-detail', args=[self.borrowings[2].pk]),
+                    {'user_id': value},
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_staff_detail_ignores_user_id(self):
+        self.authenticate_staff()
+        borrowing = self.borrowings[2]
+        for value in (self.user_a.pk, 'abc'):
+            with self.subTest(user_id=value):
+                response = self.client.get(
+                    reverse('borrowing-detail', args=[borrowing.pk]), {'user_id': value},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, BorrowingSerializer(borrowing).data)
+
+    def test_staff_combines_user_id_and_active_filters(self):
+        self.authenticate_staff()
+        for user, is_active, expected in (
+            (self.user_a, 'true', self.borrowings[0]),
+            (self.user_a, 'false', self.borrowings[1]),
+            (self.user_b, 'true', self.borrowings[2]),
+        ):
+            with self.subTest(user_id=user.pk, is_active=is_active):
+                response = self.client.get(self.list_url, {
+                    'user_id': user.pk, 'is_active': is_active,
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual([item['id'] for item in response.data], [expected.pk])
+
+    def test_normal_user_combined_filters_preserve_visibility(self):
+        self.authenticate(self.user_a)
+        for user_id, is_active, expected in (
+            (self.user_b.pk, 'true', self.borrowings[0]),
+            (self.user_a.pk, 'false', self.borrowings[1]),
+            ('abc', 'true', self.borrowings[0]),
+        ):
+            with self.subTest(user_id=user_id, is_active=is_active):
+                response = self.client.get(self.list_url, {
+                    'user_id': user_id, 'is_active': is_active,
+                })
+                self.assertEqual(response.status_code, 200)
+                ids = [item['id'] for item in response.data]
+                self.assertEqual(ids, [expected.pk])
+                for borrowing in self.borrowings[2:]:
+                    self.assertNotIn(borrowing.pk, ids)
+
+    def test_staff_invalid_combined_filters_return_first_field_error(self):
+        self.authenticate_staff()
+        for user_id, is_active, error_key in (
+            ('abc', 'true', 'user_id'),
+            (self.user_a.pk, 'banana', 'is_active'),
+            ('abc', 'banana', 'user_id'),
+        ):
+            with self.subTest(user_id=user_id, is_active=is_active):
+                response = self.client.get(self.list_url, {
+                    'user_id': user_id, 'is_active': is_active,
+                })
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(set(response.data), {error_key})
+
     def test_routes_expose_only_list_retrieve_and_create(self):
         self.assertEqual(self.list_url, '/borrowings/')
         self.assertEqual(self.detail_url, f'/borrowings/{self.borrowing.pk}/')
@@ -607,6 +733,24 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(borrowing.book, self.book)
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 1)
+
+    def test_create_ignores_user_id_query_parameter(self):
+        other = get_user_model().objects.create_user(email='other-query@example.com')
+        # Staff would parse user_id on list; create must ignore it entirely.
+        self.user.is_staff = True
+        self.user.save(update_fields=['is_staff'])
+        for index, value in enumerate((str(other.pk), 'abc')):
+            with self.subTest(user_id=value):
+                response = self.client.post(
+                    f'{self.list_url}?user_id={value}', self.payload, format='json',
+                )
+                self.assertEqual(response.status_code, 201)
+                borrowing = Borrowing.objects.get(pk=response.data['id'])
+                self.assertEqual(response.renderer_context['request'].user, self.user)
+                self.assertEqual(borrowing.user, self.user)
+                self.assertNotEqual(borrowing.user, other)
+                self.book.refresh_from_db()
+                self.assertEqual(self.book.inventory, 1 - index)
 
     def test_anonymous_cannot_create_borrowing(self):
         self.client.credentials()
