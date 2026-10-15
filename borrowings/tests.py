@@ -4,8 +4,9 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
+from django.db.models.query import QuerySet
 from django.test import TestCase
 from django.urls import resolve, reverse
 from rest_framework.exceptions import ValidationError as SerializerValidationError
@@ -562,6 +563,7 @@ class BorrowingReturnAPITests(APITestCase):
         return response
 
     def test_user_returns_own_borrowing_with_updated_read_contract(self):
+        inventory_before = self.book.inventory
         self.assertIsNone(self.borrowing.actual_return_date)
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, 200)
@@ -572,6 +574,9 @@ class BorrowingReturnAPITests(APITestCase):
             'id', 'borrow_date', 'expected_return_date', 'actual_return_date', 'book', 'user',
         })
         self.assertEqual(response.data['actual_return_date'], self.today.isoformat())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, inventory_before + 1)
+        self.assertEqual(response.data['book']['inventory'], inventory_before + 1)
 
     def test_payload_cannot_control_return_date(self):
         response = self.client.post(self.url, {
@@ -594,6 +599,7 @@ class BorrowingReturnAPITests(APITestCase):
         self.localdate.assert_not_called()
 
     def test_staff_non_superuser_can_return_other_users_borrowing(self):
+        inventory_before = self.book.inventory
         staff = get_user_model().objects.create_user(
             email='staff@example.com', password=self.password,
             is_staff=True, is_superuser=False,
@@ -605,6 +611,8 @@ class BorrowingReturnAPITests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.other_borrowing.refresh_from_db()
         self.assertEqual(self.other_borrowing.actual_return_date, self.today)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, inventory_before + 1)
 
     def test_anonymous_post_requires_authentication(self):
         self.client.credentials()
@@ -658,21 +666,89 @@ class BorrowingReturnAPITests(APITestCase):
             'detail': 'This borrowing has already been returned.',
         })
         self.assertEqual(self.borrowing.actual_return_date, original_date)
-        self.localdate.assert_not_called()
 
     def test_second_return_does_not_overwrite_first_return_date(self):
+        inventory_before = self.book.inventory
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, 200)
         self.borrowing.refresh_from_db()
         self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, inventory_before + 1)
         self.localdate.return_value = self.today + timedelta(days=1)
-        self.localdate.reset_mock()
         response = self.assert_rejected_without_changes(self.url, 409)
         self.assertEqual(response.json(), {
             'detail': 'This borrowing has already been returned.',
         })
         self.assertEqual(self.borrowing.actual_return_date, self.today)
-        self.localdate.assert_not_called()
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, inventory_before + 1)
+
+    def test_each_returned_borrowing_restores_one_unit(self):
+        Book.objects.filter(pk=self.book.pk).update(inventory=0)
+        second_borrowing = Borrowing.objects.create(
+            user=self.user, book=self.book, borrow_date=self.borrowing.borrow_date,
+            expected_return_date=self.borrowing.expected_return_date,
+        )
+        for borrowing, expected_inventory in ((self.borrowing, 1), (second_borrowing, 2)):
+            with self.subTest(borrowing=borrowing.pk):
+                response = self.client.post(reverse('borrowing-return', args=[borrowing.pk]))
+                self.assertEqual(response.status_code, 200)
+                self.book.refresh_from_db()
+                borrowing.refresh_from_db()
+                self.assertEqual(self.book.inventory, expected_inventory)
+                self.assertEqual(borrowing.actual_return_date, self.today)
+
+    def test_book_update_failure_rolls_back_return(self):
+        inventory_before = self.book.inventory
+        original_update = QuerySet.update
+        updated_models = []
+
+        def update_or_fail(queryset, **kwargs):
+            updated_models.append(queryset.model)
+            if queryset.model is Book:
+                self.assertEqual(
+                    Borrowing.objects.get(pk=self.borrowing.pk).actual_return_date,
+                    self.today,
+                )
+                raise DatabaseError('forced book update failure')
+            return original_update(queryset, **kwargs)
+
+        with patch.object(QuerySet, 'update', autospec=True, side_effect=update_or_fail):
+            with self.assertRaisesMessage(DatabaseError, 'forced book update failure'):
+                self.client.post(self.url)
+
+        self.assertEqual(updated_models, [Borrowing, Book])
+        self.borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertIsNone(self.borrowing.actual_return_date)
+        self.assertEqual(self.book.inventory, inventory_before)
+
+    def test_conditional_update_rejects_return_completed_after_lookup(self):
+        inventory_before = self.book.inventory
+        concurrent_date = self.today - timedelta(days=1)
+        original_get_object = BorrowingViewSet.get_object
+
+        def get_object_then_concurrent_return(view):
+            borrowing = original_get_object(view)
+            Borrowing.objects.filter(pk=borrowing.pk).update(actual_return_date=concurrent_date)
+            self.assertIsNone(borrowing.actual_return_date)
+            return borrowing
+
+        with patch.object(
+            BorrowingViewSet, 'get_object', autospec=True,
+            side_effect=get_object_then_concurrent_return,
+        ):
+            response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {
+            'detail': 'This borrowing has already been returned.',
+        })
+        self.borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, concurrent_date)
+        self.assertEqual(self.book.inventory, inventory_before)
 
     def test_other_users_already_returned_borrowing_stays_invisible(self):
         original_date = date(2026, 10, 10)

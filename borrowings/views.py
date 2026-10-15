@@ -1,3 +1,5 @@
+from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -5,6 +7,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from books.models import Book
 from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
 
@@ -63,13 +66,21 @@ class BorrowingViewSet(
     )
     def return_borrowing(self, request, pk=None):
         borrowing = self.get_object()
-        if borrowing.actual_return_date is not None:
-            return Response(
-                {'detail': 'This borrowing has already been returned.'},
-                status=status.HTTP_409_CONFLICT,
-            )
+        today = timezone.localdate()
 
-        borrowing.actual_return_date = timezone.localdate()
-        borrowing.save(update_fields=['actual_return_date'])
+        with transaction.atomic():
+            updated = Borrowing.objects.filter(
+                pk=borrowing.pk,
+                actual_return_date__isnull=True,
+            ).update(actual_return_date=today)
+            if updated == 0:
+                return Response(
+                    {'detail': 'This borrowing has already been returned.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            Book.objects.filter(pk=borrowing.book_id).update(inventory=F('inventory') + 1)
+
+        borrowing = self.get_queryset().get(pk=borrowing.pk)
         serializer = self.get_serializer(borrowing)
         return Response(serializer.data, status=status.HTTP_200_OK)
