@@ -483,12 +483,17 @@ class BorrowingReadTests(APITestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(set(response.data), {error_key})
 
-    def test_routes_expose_only_list_retrieve_and_create(self):
+    def test_routes_expose_only_list_retrieve_create_and_return(self):
         self.assertEqual(self.list_url, '/borrowings/')
         self.assertEqual(self.detail_url, f'/borrowings/{self.borrowing.pk}/')
-        self.assertEqual(len(urlpatterns), 2)
+        return_url = reverse('borrowing-return', args=[self.borrowing.pk])
+        self.assertEqual(return_url, f'/borrowings/{self.borrowing.pk}/return/')
+        match = resolve(return_url)
+        self.assertIs(match.func.cls, BorrowingViewSet)
+        self.assertEqual(match.func.actions, {'post': 'return_borrowing'})
+        self.assertEqual(len(urlpatterns), 3)
         self.assertEqual({pattern.name for pattern in urlpatterns}, {
-            'borrowing-list', 'borrowing-detail',
+            'borrowing-list', 'borrowing-detail', 'borrowing-return',
         })
         for url, action in ((self.list_url, 'list'), (self.detail_url, 'retrieve')):
             with self.subTest(url=url):
@@ -502,6 +507,192 @@ class BorrowingReadTests(APITestCase):
                     {method: action for method, action in match.func.actions.items() if method != 'head'},
                     expected_actions,
                 )
+
+
+class BorrowingReturnAPITests(APITestCase):
+    def setUp(self):
+        self.today = date(2026, 10, 15)
+        date_patch = patch('borrowings.views.timezone.localdate', return_value=self.today)
+        self.localdate = date_patch.start()
+        self.addCleanup(date_patch.stop)
+        self.password = 'borrowings-return-test-password'
+        self.user = get_user_model().objects.create_user(
+            email='reader@example.com', password=self.password,
+        )
+        self.other_user = get_user_model().objects.create_user(email='other@example.com')
+        self.assertFalse(self.user.is_staff)
+        self.assertFalse(self.user.is_superuser)
+        self.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        self.borrowing = Borrowing.objects.create(
+            user=self.user, book=self.book, borrow_date=date(2026, 10, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+        self.other_borrowing = Borrowing.objects.create(
+            user=self.other_user, book=self.book, borrow_date=date(2026, 10, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+        self.url = reverse('borrowing-return', args=[self.borrowing.pk])
+        self.other_url = reverse('borrowing-return', args=[self.other_borrowing.pk])
+        self.authenticate(self.user)
+
+    def authenticate(self, user):
+        token_url = reverse('token-obtain-pair')
+        self.assertEqual(token_url, '/users/token/')
+        response = self.client.post(token_url, {
+            'email': user.email, 'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        access = response.data['access']
+        self.assertTrue(access)
+        self.client.credentials(HTTP_AUTHORIZE=f'Bearer {access}')
+        return access
+
+    def assert_rejected_without_changes(self, url, expected_status, method='post'):
+        borrowings_before = list(Borrowing.objects.order_by('pk').values())
+        books_before = list(Book.objects.order_by('pk').values())
+        response = getattr(self.client, method)(url)
+        self.assertEqual(response.status_code, expected_status)
+        self.borrowing.refresh_from_db()
+        self.other_borrowing.refresh_from_db()
+        self.assertEqual(list(Borrowing.objects.order_by('pk').values()), borrowings_before)
+        self.assertEqual(list(Book.objects.order_by('pk').values()), books_before)
+        return response
+
+    def test_user_returns_own_borrowing_with_updated_read_contract(self):
+        self.assertIsNone(self.borrowing.actual_return_date)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.borrowing.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.assertEqual(response.data, BorrowingSerializer(self.borrowing).data)
+        self.assertEqual(set(response.data), {
+            'id', 'borrow_date', 'expected_return_date', 'actual_return_date', 'book', 'user',
+        })
+        self.assertEqual(response.data['actual_return_date'], self.today.isoformat())
+
+    def test_payload_cannot_control_return_date(self):
+        response = self.client.post(self.url, {
+            'actual_return_date': '2000-01-01',
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.borrowing.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+
+    def test_return_on_borrow_date_is_accepted(self):
+        self.localdate.return_value = self.borrowing.borrow_date
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.borrowing.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.borrowing.borrow_date)
+
+    def test_other_users_borrowing_is_not_visible(self):
+        self.assert_rejected_without_changes(self.other_url, 404)
+        self.assertIsNone(self.other_borrowing.actual_return_date)
+        self.localdate.assert_not_called()
+
+    def test_staff_non_superuser_can_return_other_users_borrowing(self):
+        staff = get_user_model().objects.create_user(
+            email='staff@example.com', password=self.password,
+            is_staff=True, is_superuser=False,
+        )
+        self.assertTrue(staff.is_staff)
+        self.assertFalse(staff.is_superuser)
+        self.authenticate(staff)
+        response = self.client.post(self.other_url)
+        self.assertEqual(response.status_code, 200)
+        self.other_borrowing.refresh_from_db()
+        self.assertEqual(self.other_borrowing.actual_return_date, self.today)
+
+    def test_anonymous_post_requires_authentication(self):
+        self.client.credentials()
+        self.assert_rejected_without_changes(self.url, 401)
+
+    def test_authorization_header_does_not_authenticate_return(self):
+        access = self.authenticate(self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+        self.assert_rejected_without_changes(self.url, 401)
+
+    def test_missing_borrowing_returns_404(self):
+        missing_pk = self.other_borrowing.pk + 1
+        self.assertFalse(Borrowing.objects.filter(pk=missing_pk).exists())
+        self.assert_rejected_without_changes(
+            reverse('borrowing-return', args=[missing_pk]), 404,
+        )
+
+    def test_authenticated_wrong_methods_return_405(self):
+        for method in ('get', 'put', 'patch', 'delete'):
+            with self.subTest(method=method):
+                self.assert_rejected_without_changes(self.url, 405, method)
+
+    def test_anonymous_wrong_methods_require_authentication(self):
+        self.client.credentials()
+        for method in ('get', 'put', 'patch', 'delete'):
+            with self.subTest(method=method):
+                self.assert_rejected_without_changes(self.url, 401, method)
+
+    def test_list_filters_do_not_affect_return_or_visibility(self):
+        query = f'?is_active=false&user_id={self.other_user.pk}'
+        response = self.client.post(self.url + query)
+        self.assertEqual(response.status_code, 200)
+        self.borrowing.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.assert_rejected_without_changes(self.other_url + query, 404)
+
+    def test_staff_return_ignores_invalid_list_filters(self):
+        self.user.is_staff = True
+        self.user.save(update_fields=['is_staff'])
+        response = self.client.post(self.other_url + '?is_active=invalid&user_id=invalid')
+        self.assertEqual(response.status_code, 200)
+        self.other_borrowing.refresh_from_db()
+        self.assertEqual(self.other_borrowing.actual_return_date, self.today)
+
+    def test_existing_return_is_rejected_with_conflict(self):
+        original_date = date(2026, 10, 10)
+        self.borrowing.actual_return_date = original_date
+        self.borrowing.save(update_fields=['actual_return_date'])
+        response = self.assert_rejected_without_changes(self.url, 409)
+        self.assertEqual(response.json(), {
+            'detail': 'This borrowing has already been returned.',
+        })
+        self.assertEqual(self.borrowing.actual_return_date, original_date)
+        self.localdate.assert_not_called()
+
+    def test_second_return_does_not_overwrite_first_return_date(self):
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.borrowing.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.localdate.return_value = self.today + timedelta(days=1)
+        self.localdate.reset_mock()
+        response = self.assert_rejected_without_changes(self.url, 409)
+        self.assertEqual(response.json(), {
+            'detail': 'This borrowing has already been returned.',
+        })
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.localdate.assert_not_called()
+
+    def test_other_users_already_returned_borrowing_stays_invisible(self):
+        original_date = date(2026, 10, 10)
+        self.other_borrowing.actual_return_date = original_date
+        self.other_borrowing.save(update_fields=['actual_return_date'])
+        self.assert_rejected_without_changes(self.other_url, 404)
+        self.assertEqual(self.other_borrowing.actual_return_date, original_date)
+        self.localdate.assert_not_called()
+
+    def test_return_moves_borrowing_from_active_to_inactive_list(self):
+        list_url = reverse('borrowing-list')
+        response = self.client.get(list_url, {'is_active': 'true'})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(self.borrowing.pk, [item['id'] for item in response.data])
+        self.assertEqual(self.client.post(self.url).status_code, 200)
+        for is_active, expected_ids in (('true', []), ('false', [self.borrowing.pk])):
+            with self.subTest(is_active=is_active):
+                response = self.client.get(list_url, {'is_active': is_active})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual([item['id'] for item in response.data], expected_ids)
 
 
 class BorrowingCreateSerializerTests(TestCase):
