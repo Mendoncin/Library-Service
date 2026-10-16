@@ -7,7 +7,7 @@ from django.core.exceptions import ValidationError
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.db.models.query import QuerySet
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import resolve, reverse
 from rest_framework.exceptions import ValidationError as SerializerValidationError
 from rest_framework.test import APITestCase
@@ -18,6 +18,8 @@ from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
 from borrowings.urls import urlpatterns
 from borrowings.views import BorrowingViewSet
+from notifications.services import notify_borrowing_created
+from notifications.telegram import TelegramNotificationError
 
 
 class BorrowingTests(TestCase):
@@ -919,8 +921,12 @@ class BorrowingCreateSerializerTests(TestCase):
             self.assertEqual(errors[0].code, 'required')
 
 
+@override_settings(TELEGRAM_BOT_TOKEN='test-token', TELEGRAM_CHAT_ID='12345')
 class BorrowingCreateAPITests(APITestCase):
     def setUp(self):
+        notify_patch = patch('borrowings.views.notify_borrowing_created')
+        self.notify_mock = notify_patch.start()
+        self.addCleanup(notify_patch.stop)
         self.today = date(2026, 10, 13)
         date_patch = patch('borrowings.serializers.timezone.localdate', return_value=self.today)
         date_patch.start()
@@ -950,7 +956,12 @@ class BorrowingCreateAPITests(APITestCase):
         }
 
     def test_regular_user_can_create_borrowing_with_jwt(self):
-        response = self.client.post(self.list_url, self.payload, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(self.list_url, self.payload, format='json')
+            self.notify_mock.assert_not_called()
+        self.assertEqual(len(callbacks), 1)
+        self.notify_mock.assert_called_once()
+        self.assertEqual(self.notify_mock.call_args.args[0].pk, response.data['id'])
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.renderer_context['request'].user, self.user)
         self.assertEqual(Borrowing.objects.count(), 1)
@@ -1021,7 +1032,10 @@ class BorrowingCreateAPITests(APITestCase):
 
     def test_anonymous_cannot_create_borrowing(self):
         self.client.credentials()
-        response = self.client.post(self.list_url, self.payload, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(callbacks, [])
+        self.notify_mock.assert_not_called()
         self.assertEqual(response.status_code, 401)
         self.assertFalse(Borrowing.objects.exists())
         self.book.refresh_from_db()
@@ -1029,7 +1043,10 @@ class BorrowingCreateAPITests(APITestCase):
 
     def test_out_of_stock_returns_400_without_creating_borrowing(self):
         Book.objects.filter(pk=self.book.pk).update(inventory=0)
-        response = self.client.post(self.list_url, self.payload, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(callbacks, [])
+        self.notify_mock.assert_not_called()
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data, {'book': ['This book is out of stock.']})
         self.assertFalse(Borrowing.objects.exists())
@@ -1046,6 +1063,69 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertFalse(Borrowing.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
+
+    def test_insert_failure_rolls_back_without_registering_notification(self):
+        def fail_insert(**kwargs):
+            self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 1)
+            raise IntegrityError('forced borrowing insert failure')
+
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with patch('borrowings.serializers.Borrowing.objects.create', side_effect=fail_insert):
+                with self.assertRaisesMessage(IntegrityError, 'forced borrowing insert failure'):
+                    self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(callbacks, [])
+        self.notify_mock.assert_not_called()
+        self.assertFalse(Borrowing.objects.exists())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+
+    def test_notification_waits_for_on_commit_callback(self):
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.post(self.list_url, self.payload, format='json')
+            self.notify_mock.assert_not_called()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(callbacks), 1)
+        self.notify_mock.assert_not_called()
+
+        def check_persisted_state(borrowing):
+            self.assertEqual(borrowing.pk, response.data['id'])
+            self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
+            self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 1)
+
+        self.notify_mock.side_effect = check_persisted_state
+        callbacks[0]()
+        self.notify_mock.assert_called_once()
+
+    def test_outer_rollback_discards_notification(self):
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with transaction.atomic():
+                response = self.client.post(self.list_url, self.payload, format='json')
+                self.assertEqual(response.status_code, 201)
+                self.notify_mock.assert_not_called()
+                transaction.set_rollback(True)
+        self.assertEqual(callbacks, [])
+        self.notify_mock.assert_not_called()
+        self.assertFalse(Borrowing.objects.exists())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+
+    def test_telegram_failure_preserves_successful_creation(self):
+        self.notify_mock.side_effect = notify_borrowing_created
+        with patch(
+            'notifications.services.send_telegram_message',
+            side_effect=TelegramNotificationError('Telegram request failed.'),
+        ) as send:
+            with self.assertLogs('notifications.services', level='ERROR'):
+                with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                    response = self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data, {'id': response.data['id'], **self.payload})
+        self.assertEqual(len(callbacks), 1)
+        self.notify_mock.assert_called_once()
+        send.assert_called_once()
+        self.assertTrue(Borrowing.objects.filter(pk=response.data['id']).exists())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 1)
 
     def test_expected_return_today_is_accepted(self):
         response = self.client.post(self.list_url, {
