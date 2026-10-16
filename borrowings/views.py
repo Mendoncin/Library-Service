@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from books.models import Book
 from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
+from notifications.services import notify_borrowing_created
 
 
 class BorrowingViewSet(
@@ -56,7 +57,8 @@ class BorrowingViewSet(
         return super().get_serializer_class()
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        borrowing = serializer.save(user=self.request.user)
+        transaction.on_commit(lambda: notify_borrowing_created(borrowing))
 
     @action(
         detail=True,
