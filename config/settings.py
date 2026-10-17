@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     'books.apps.BooksConfig',
     'users.apps.UsersConfig',
     'borrowings.apps.BorrowingsConfig',
+    'payments.apps.PaymentsConfig',
 ]
 
 AUTH_USER_MODEL = 'users.User'
