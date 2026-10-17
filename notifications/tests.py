@@ -8,7 +8,13 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from books.models import Book
 from borrowings.models import Borrowing
-from notifications.services import format_borrowing_notification, notify_borrowing_created
+from notifications.services import (
+    format_borrowing_notification,
+    format_overdue_borrowing_notification,
+    notify_borrowing_created,
+    notify_borrowing_overdue,
+    notify_no_overdue_borrowings,
+)
 from notifications.telegram import TelegramNotificationError, send_telegram_message
 
 
@@ -141,3 +147,52 @@ class PersistedBorrowingNotificationTests(TestCase):
         send.assert_called_once_with(
             EXPECTED_MESSAGE.replace('Borrowing ID: 7', f'Borrowing ID: {borrowing.pk}'),
         )
+
+
+class OverdueNotificationServiceTests(SimpleTestCase):
+    expected_message = (
+        'Overdue borrowing\n\n'
+        'Borrowing ID: 7\n'
+        'User: reader@example.com\n'
+        'Book: Clean Code by Robert C. Martin\n'
+        'Borrow date: 2026-10-13\n'
+        'Expected return date: 2026-10-20'
+    )
+
+    def setUp(self):
+        self.borrowing = borrowing_fixture()
+        patcher = patch('notifications.services.send_telegram_message')
+        self.send = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_formatter_exact_output_without_sending(self):
+        self.assertEqual(format_overdue_borrowing_notification(self.borrowing), self.expected_message)
+        self.send.assert_not_called()
+
+    def test_overdue_success_sends_once(self):
+        self.assertIsNone(notify_borrowing_overdue(self.borrowing))
+        self.send.assert_called_once_with(self.expected_message)
+
+    def test_overdue_send_failure_is_logged_and_not_propagated(self):
+        self.send.side_effect = TelegramNotificationError('Telegram request failed.')
+        with self.assertLogs('notifications.services', level='ERROR') as logs:
+            self.assertIsNone(notify_borrowing_overdue(self.borrowing))
+        self.assertIn('Failed to send overdue borrowing notification (borrowing_id=7).', logs.output[0])
+        self.send.assert_called_once_with(self.expected_message)
+
+    def test_overdue_formatter_failure_is_logged_and_not_propagated(self):
+        with patch('notifications.services.format_overdue_borrowing_notification', side_effect=ValueError):
+            with self.assertLogs('notifications.services', level='ERROR'):
+                self.assertIsNone(notify_borrowing_overdue(self.borrowing))
+        self.send.assert_not_called()
+
+    def test_no_overdue_success_sends_exact_message_once(self):
+        self.assertIsNone(notify_no_overdue_borrowings())
+        self.send.assert_called_once_with('No borrowings overdue today!')
+
+    def test_no_overdue_failure_is_logged_and_not_propagated(self):
+        self.send.side_effect = TelegramNotificationError('Telegram request failed.')
+        with self.assertLogs('notifications.services', level='ERROR') as logs:
+            self.assertIsNone(notify_no_overdue_borrowings())
+        self.assertIn('Failed to send no-overdue notification.', logs.output[0])
+        self.send.assert_called_once_with('No borrowings overdue today!')
