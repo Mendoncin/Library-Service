@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -16,9 +16,10 @@ from books.models import Book
 from books.serializers import BookSerializer
 from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
+from borrowings.tasks import check_overdue_borrowings, get_overdue_borrowings
 from borrowings.urls import urlpatterns
 from borrowings.views import BorrowingViewSet
-from notifications.services import notify_borrowing_created
+from notifications.services import format_overdue_borrowing_notification, notify_borrowing_created
 from notifications.telegram import TelegramNotificationError
 
 
@@ -1161,3 +1162,96 @@ class BorrowingCreateAPITests(APITestCase):
                 self.assertEqual(response.status_code, 405)
                 self.assertEqual(list(Borrowing.objects.order_by('pk').values()), original_borrowings)
                 self.assertEqual(list(Book.objects.order_by('pk').values()), original_books)
+
+
+class OverdueBorrowingTests(TestCase):
+    def setUp(self):
+        self.today = date(2026, 10, 20)
+        date_patch = patch('borrowings.tasks.timezone.localdate', return_value=self.today)
+        self.localdate = date_patch.start()
+        self.addCleanup(date_patch.stop)
+        self.user = get_user_model().objects.create_user(email='overdue@example.com')
+        self.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=5, daily_fee=Decimal('1.50'),
+        )
+
+    def create_borrowing(self, days, returned=False):
+        return Borrowing.objects.create(
+            user=self.user, book=self.book,
+            borrow_date=self.today - timedelta(days=7),
+            expected_return_date=self.today + timedelta(days=days),
+            actual_return_date=self.today if returned else None,
+        )
+
+    def test_query_boundaries_and_order(self):
+        today = self.create_borrowing(0)
+        yesterday = self.create_borrowing(-1)
+        yesterday_tie = self.create_borrowing(-1)
+        self.create_borrowing(1)
+        self.create_borrowing(-1, returned=True)
+        self.create_borrowing(0, returned=True)
+        self.assertEqual(list(get_overdue_borrowings()), [yesterday, yesterday_tie, today])
+        self.localdate.assert_called_once_with()
+
+    def test_related_book_and_user_load_in_one_query(self):
+        for days in (-2, -1, 0):
+            self.create_borrowing(days)
+        with self.assertNumQueries(1):
+            details = [
+                (borrowing.book.title, borrowing.book.author, borrowing.user.email)
+                for borrowing in get_overdue_borrowings()
+            ]
+        self.assertEqual(details, [('Book', 'Author', 'overdue@example.com')] * 3)
+
+    def test_unreturned_overdue_remains_eligible_next_day(self):
+        borrowing = self.create_borrowing(0)
+        self.assertEqual(list(get_overdue_borrowings()), [borrowing])
+        self.localdate.return_value = self.today + timedelta(days=1)
+        self.assertEqual(list(get_overdue_borrowings()), [borrowing])
+
+    @patch('borrowings.tasks.notify_no_overdue_borrowings')
+    @patch('borrowings.tasks.notify_borrowing_overdue')
+    def test_task_notifies_only_eligible_borrowings_in_order(self, notify, notify_empty):
+        today = self.create_borrowing(0)
+        yesterday = self.create_borrowing(-1)
+        yesterday_tie = self.create_borrowing(-1)
+        self.create_borrowing(1)
+        self.create_borrowing(-1, returned=True)
+        self.create_borrowing(0, returned=True)
+        with self.assertNumQueries(1):
+            self.assertIsNone(check_overdue_borrowings.run())
+        self.assertEqual(notify.call_args_list, [call(yesterday), call(yesterday_tie), call(today)])
+        notify_empty.assert_not_called()
+
+    def assert_no_overdue_notification(self):
+        with patch('borrowings.tasks.notify_borrowing_overdue') as notify:
+            with patch('borrowings.tasks.notify_no_overdue_borrowings') as notify_empty:
+                with self.assertNumQueries(1):
+                    self.assertIsNone(check_overdue_borrowings.run())
+                notify.assert_not_called()
+                notify_empty.assert_called_once_with()
+
+    def test_empty_database_sends_no_overdue_once(self):
+        self.assert_no_overdue_notification()
+
+    def test_only_future_sends_no_overdue_once(self):
+        self.create_borrowing(1)
+        self.assert_no_overdue_notification()
+
+    def test_only_returned_sends_no_overdue_once(self):
+        self.create_borrowing(-1, returned=True)
+        self.create_borrowing(0, returned=True)
+        self.assert_no_overdue_notification()
+
+    @patch('borrowings.tasks.notify_no_overdue_borrowings')
+    @patch('notifications.services.send_telegram_message')
+    def test_transport_failure_does_not_stop_remaining_notifications(self, send, notify_empty):
+        borrowings = [self.create_borrowing(days) for days in (-2, -1, 0)]
+        send.side_effect = [TelegramNotificationError('Telegram request failed.'), None, None]
+        with self.assertLogs('notifications.services', level='ERROR'):
+            self.assertIsNone(check_overdue_borrowings.run())
+        self.assertEqual(send.call_args_list, [
+            call(format_overdue_borrowing_notification(borrowing)) for borrowing in borrowings
+        ])
+        notify_empty.assert_not_called()
