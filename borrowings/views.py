@@ -1,5 +1,6 @@
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Prefetch
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -11,6 +12,8 @@ from books.models import Book
 from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
 from notifications.services import notify_borrowing_created
+from payments.models import Payment
+from payments.services import create_checkout_session, create_payment_for_borrowing
 
 
 class BorrowingViewSet(
@@ -19,7 +22,9 @@ class BorrowingViewSet(
     mixins.RetrieveModelMixin,
     viewsets.GenericViewSet,
 ):
-    queryset = Borrowing.objects.select_related('book').order_by('id')
+    queryset = Borrowing.objects.select_related('book').prefetch_related(
+        Prefetch('payments', queryset=Payment.objects.order_by('id')),
+    ).order_by('id')
     serializer_class = BorrowingSerializer
     permission_classes = [IsAuthenticated]
 
@@ -57,8 +62,16 @@ class BorrowingViewSet(
         return super().get_serializer_class()
 
     def perform_create(self, serializer):
-        borrowing = serializer.save(user=self.request.user)
-        transaction.on_commit(lambda: notify_borrowing_created(borrowing))
+        with transaction.atomic():
+            borrowing = serializer.save(user=self.request.user)
+            borrowing_url = self.request.build_absolute_uri(
+                reverse('borrowing-detail', args=[borrowing.pk]),
+            )
+            session = create_checkout_session(
+                borrowing, success_url=borrowing_url, cancel_url=borrowing_url,
+            )
+            create_payment_for_borrowing(borrowing, session)
+            transaction.on_commit(lambda: notify_borrowing_created(borrowing))
 
     @action(
         detail=True,
