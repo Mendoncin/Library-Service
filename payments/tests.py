@@ -1,10 +1,11 @@
 from datetime import date
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models.deletion import ProtectedError
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
@@ -12,6 +13,147 @@ from books.models import Book
 from borrowings.models import Borrowing
 from payments.models import Payment
 from payments.serializers import PaymentSerializer
+from payments.services import (
+    calculate_borrowing_price,
+    convert_to_stripe_amount,
+    create_checkout_session,
+)
+
+
+class BorrowingPriceTests(SimpleTestCase):
+    def setUp(self):
+        self.borrowing = Borrowing(
+            book=Book(title='Book', inventory=5, daily_fee=Decimal('2.50')),
+            borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 25),
+        )
+
+    def assert_price(self, expected):
+        result = calculate_borrowing_price(self.borrowing)
+        self.assertEqual(result, Decimal(expected))
+        self.assertIsInstance(result, Decimal)
+
+    def test_one_day(self):
+        self.borrowing.expected_return_date = date(2026, 10, 21)
+        self.assert_price('2.50')
+
+    def test_multiple_days(self):
+        self.assert_price('12.50')
+
+    def test_same_day(self):
+        self.borrowing.expected_return_date = self.borrowing.borrow_date
+        self.assert_price('0.00')
+
+    def test_zero_daily_fee(self):
+        self.borrowing.book.daily_fee = Decimal('0.00')
+        self.assert_price('0.00')
+
+    def test_different_daily_fee(self):
+        self.borrowing.expected_return_date = date(2026, 10, 23)
+        self.borrowing.book.daily_fee = Decimal('1.75')
+        self.assert_price('5.25')
+
+    def test_actual_return_date_is_ignored(self):
+        self.borrowing.actual_return_date = date(2026, 10, 21)
+        self.assert_price('12.50')
+
+
+class StripeAmountTests(SimpleTestCase):
+    def test_decimal_amounts_convert_to_integer_minor_units(self):
+        for amount, expected in (
+            ('0.00', 0), ('0.01', 1), ('1.00', 100),
+            ('5.50', 550), ('12.34', 1234),
+        ):
+            with self.subTest(amount=amount):
+                result = convert_to_stripe_amount(Decimal(amount))
+                self.assertEqual(result, expected)
+                self.assertIs(type(result), int)
+
+    def test_excess_decimal_places_are_rejected(self):
+        with self.assertRaisesMessage(
+            ValueError, 'Amount has more than 2 decimal places.',
+        ):
+            convert_to_stripe_amount(Decimal('5.555'))
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class StripeCheckoutSessionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        user = get_user_model().objects.create_user(email='reader@example.com')
+        cls.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=5, daily_fee=Decimal('2.50'),
+        )
+        cls.borrowing = Borrowing.objects.create(
+            user=user, book=cls.book, borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 25),
+        )
+
+    def setUp(self):
+        create_patch = patch('payments.services.stripe.checkout.Session.create')
+        self.mock_create = create_patch.start()
+        self.addCleanup(create_patch.stop)
+        self.success_url = 'https://example.com/success'
+        self.cancel_url = 'https://example.com/cancel'
+
+    def test_session_payload_return_and_domain_state(self):
+        fake_session = object()
+        self.mock_create.return_value = fake_session
+        payment_count = Payment.objects.count()
+        borrowing_state = Borrowing.objects.values().get(pk=self.borrowing.pk)
+        self.assertEqual(self.book.inventory, 5)
+
+        result = create_checkout_session(
+            self.borrowing, self.success_url, self.cancel_url,
+        )
+
+        self.assertIs(result, fake_session)
+        self.mock_create.assert_called_once()
+        payload = self.mock_create.call_args.kwargs
+        self.assertEqual(payload['api_key'], 'sk_test_fake')
+        self.assertEqual(payload['mode'], 'payment')
+        self.assertEqual(payload['success_url'], self.success_url)
+        self.assertEqual(payload['cancel_url'], self.cancel_url)
+        self.assertEqual(len(payload['line_items']), 1)
+        item = payload['line_items'][0]
+        self.assertEqual(item['quantity'], 1)
+        self.assertEqual(item['price_data']['currency'], 'usd')
+        self.assertEqual(item['price_data']['unit_amount'], 1250)
+        self.assertIs(type(item['price_data']['unit_amount']), int)
+        self.assertEqual(item['price_data']['product_data'], {
+            'name': self.book.title,
+        })
+        self.assertEqual(Payment.objects.count(), payment_count)
+        for field, value in borrowing_state.items():
+            self.assertEqual(getattr(self.borrowing, field), value)
+        self.assertEqual(
+            Borrowing.objects.values().get(pk=self.borrowing.pk), borrowing_state,
+        )
+        self.assertEqual(self.borrowing.book.inventory, 5)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 5)
+
+    def test_same_day_still_calls_stripe_with_zero_amount(self):
+        self.borrowing.expected_return_date = self.borrowing.borrow_date
+
+        create_checkout_session(self.borrowing, self.success_url, self.cancel_url)
+
+        self.mock_create.assert_called_once()
+        item = self.mock_create.call_args.kwargs['line_items'][0]
+        self.assertEqual(item['price_data']['unit_amount'], 0)
+        self.assertIs(type(item['price_data']['unit_amount']), int)
+        self.assertEqual(item['quantity'], 1)
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_missing_secret_fails_before_stripe_call(self):
+        with self.assertRaisesMessage(
+            ImproperlyConfigured, 'Stripe is not configured.',
+        ):
+            create_checkout_session(
+                self.borrowing, self.success_url, self.cancel_url,
+            )
+        self.mock_create.assert_not_called()
 
 
 class PaymentModelTests(TestCase):
