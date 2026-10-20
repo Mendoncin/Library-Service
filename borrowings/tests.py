@@ -1,13 +1,17 @@
 from datetime import date, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import stripe
+
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError
-from django.db import DatabaseError, IntegrityError, transaction
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.db import DatabaseError, IntegrityError, connection, transaction
 from django.db.models.deletion import ProtectedError
 from django.db.models.query import QuerySet
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import resolve, reverse
 from rest_framework.exceptions import ValidationError as SerializerValidationError
 from rest_framework.test import APITestCase
@@ -21,6 +25,9 @@ from borrowings.urls import urlpatterns
 from borrowings.views import BorrowingViewSet
 from notifications.services import format_overdue_borrowing_notification, notify_borrowing_created
 from notifications.telegram import TelegramNotificationError
+from payments.models import Payment
+from payments.serializers import PaymentSerializer
+from payments.services import convert_to_stripe_amount
 
 
 class BorrowingTests(TestCase):
@@ -191,11 +198,13 @@ class BorrowingReadTests(APITestCase):
                     ),
                     'book': BookSerializer(borrowing.book).data,
                     'user': borrowing.user_id,
+                    'payments': [],
                 })
 
     def test_serializer_fields_are_read_only(self):
         serializer = BorrowingSerializer()
         self.assertIsInstance(serializer.fields['book'], BookSerializer)
+        self.assertIsInstance(serializer.fields['payments'].child, PaymentSerializer)
         for name, field in serializer.fields.items():
             with self.subTest(field=name):
                 self.assertTrue(field.read_only)
@@ -512,6 +521,76 @@ class BorrowingReadTests(APITestCase):
                     expected_actions,
                 )
 
+    def test_nested_payments_order_shape_and_visibility(self):
+        # Insert IDs out of order so creation order cannot satisfy the contract.
+        payment = Payment.objects.create(
+            id=30, borrowing=self.borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('17.50'), session_id='cs_read',
+            session_url='https://checkout.stripe.com/c/pay/cs_read',
+        )
+        fine = Payment.objects.create(
+            id=10, borrowing=self.borrowing, type=Payment.Type.FINE,
+            money_to_pay=Decimal('3.00'), status=Payment.Status.PAID,
+        )
+        foreign = Payment.objects.create(
+            id=20, borrowing=self.borrowings[2], type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('7.50'),
+        )
+        expected = PaymentSerializer([fine, payment], many=True).data
+        self.authenticate(self.user_a)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['id'] for item in response.data], [
+            item.pk for item in self.borrowings[:2]
+        ])
+        self.assertEqual(response.data[0]['payments'], expected)
+        self.assertEqual(response.data[1]['payments'], [])
+        response = self.client.get(self.detail_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['payments'], expected)
+        foreign_url = reverse('borrowing-detail', args=[self.borrowings[2].pk])
+        self.assertEqual(self.client.get(foreign_url).status_code, 404)
+        self.authenticate_staff()
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 4)
+        self.assertEqual(response.data[0]['payments'], expected)
+        self.assertEqual(response.data[2]['payments'], [PaymentSerializer(foreign).data])
+        response = self.client.get(foreign_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['payments'], [PaymentSerializer(foreign).data])
+
+    def test_nested_payments_do_not_add_queries_per_borrowing(self):
+        # A separate user makes the comparison exactly one versus three borrowings.
+        user = get_user_model().objects.create_user(email='query-count@example.com')
+        self.client.force_authenticate(user=user)
+
+        def add_borrowing():
+            borrowing = Borrowing.objects.create(
+                user=user, book=self.borrowing.book, borrow_date=date(2026, 10, 1),
+                expected_return_date=date(2026, 10, 20),
+            )
+            Payment.objects.create(
+                borrowing=borrowing, type=Payment.Type.PAYMENT,
+                money_to_pay=Decimal('17.50'),
+            )
+
+        add_borrowing()
+        with CaptureQueriesContext(connection) as one:
+            first = self.client.get(self.list_url)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(len(first.data), 1)
+        add_borrowing()
+        add_borrowing()
+        with CaptureQueriesContext(connection) as three:
+            second = self.client.get(self.list_url)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(second.data), 3)
+        for item in second.data:
+            self.assertEqual(len(item['payments']), 1)
+        self.assertEqual(len(one), len(three))
+        self.assertEqual(sum('payments_payment' in q['sql'] for q in three), 1)
+
 
 class BorrowingReturnAPITests(APITestCase):
     def setUp(self):
@@ -574,7 +653,7 @@ class BorrowingReturnAPITests(APITestCase):
         self.assertEqual(self.borrowing.actual_return_date, self.today)
         self.assertEqual(response.data, BorrowingSerializer(self.borrowing).data)
         self.assertEqual(set(response.data), {
-            'id', 'borrow_date', 'expected_return_date', 'actual_return_date', 'book', 'user',
+            'id', 'borrow_date', 'expected_return_date', 'actual_return_date', 'book', 'user', 'payments',
         })
         self.assertEqual(response.data['actual_return_date'], self.today.isoformat())
         self.book.refresh_from_db()
@@ -795,8 +874,10 @@ class BorrowingCreateSerializerTests(TestCase):
 
     def test_serializer_exposes_only_create_fields(self):
         serializer = BorrowingCreateSerializer()
-        self.assertEqual(set(serializer.fields), {'id', 'book', 'expected_return_date'})
+        self.assertEqual(set(serializer.fields), {'id', 'book', 'expected_return_date', 'payments'})
         self.assertTrue(serializer.fields['id'].read_only)
+        self.assertTrue(serializer.fields['payments'].read_only)
+        self.assertIsInstance(serializer.fields['payments'].child, PaymentSerializer)
         for name in ('book', 'expected_return_date'):
             with self.subTest(field=name):
                 self.assertFalse(serializer.fields[name].read_only)
@@ -815,7 +896,7 @@ class BorrowingCreateSerializerTests(TestCase):
         self.assertEqual(borrowing.expected_return_date, self.today + timedelta(days=7))
         self.assertIsNone(borrowing.actual_return_date)
         self.assertEqual(self.book.inventory, 1)
-        self.assertEqual(serializer.data, {'id': borrowing.pk, **self.payload})
+        self.assertEqual(serializer.data, {'id': borrowing.pk, **self.payload, 'payments': []})
 
     def test_zero_inventory_is_rejected_during_validation(self):
         Book.objects.filter(pk=self.book.pk).update(inventory=0)
@@ -860,17 +941,17 @@ class BorrowingCreateSerializerTests(TestCase):
         self.assertEqual(self.book.inventory, 2)
         self.assertFalse(Borrowing.objects.exists())
 
-    def test_expected_return_today_is_valid(self):
+    def test_expected_return_today_is_rejected_by_minimum(self):
         serializer = BorrowingCreateSerializer(data={
             **self.payload, 'expected_return_date': self.today.isoformat(),
         })
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        borrowing = serializer.save(user=self.user)
-        borrowing.refresh_from_db()
-        self.assertEqual(borrowing.expected_return_date, borrowing.borrow_date)
-        self.assertEqual(borrowing.borrow_date, self.today)
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(serializer.errors, {
+            'non_field_errors': ['Borrowing total must be at least $0.50.'],
+        })
         self.book.refresh_from_db()
-        self.assertEqual(self.book.inventory, 1)
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
 
     def test_missing_book_is_rejected(self):
         serializer = BorrowingCreateSerializer(data={**self.payload, 'book': self.book.pk + 1})
@@ -901,10 +982,10 @@ class BorrowingCreateSerializerTests(TestCase):
 
     def test_date_change_after_validation_is_rejected_before_decrement(self):
         serializer = BorrowingCreateSerializer(data={
-            **self.payload, 'expected_return_date': self.today.isoformat(),
+            **self.payload, 'expected_return_date': (self.today + timedelta(days=1)).isoformat(),
         })
         self.assertTrue(serializer.is_valid(), serializer.errors)
-        self.localdate.return_value = self.today + timedelta(days=1)
+        self.localdate.return_value = self.today + timedelta(days=2)
         with self.assertRaises(SerializerValidationError) as caught:
             serializer.save(user=self.user)
         self.assertEqual(caught.exception.detail, {
@@ -914,6 +995,25 @@ class BorrowingCreateSerializerTests(TestCase):
         self.assertEqual(self.book.inventory, 2)
         self.assertFalse(Borrowing.objects.exists())
 
+    def test_midnight_minimum_recheck_precedes_inventory_update(self):
+        serializer = BorrowingCreateSerializer(data={
+            **self.payload,
+            'expected_return_date': (self.today + timedelta(days=1)).isoformat(),
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.localdate.return_value = self.today + timedelta(days=1)
+        with patch('borrowings.serializers.Book.objects.filter') as book_filter:
+            with self.assertRaises(SerializerValidationError) as caught:
+                serializer.save(user=self.user)
+        book_filter.assert_not_called()
+        self.assertEqual(caught.exception.detail, {
+            'non_field_errors': ['Borrowing total must be at least $0.50.'],
+        })
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+
     def test_book_and_expected_return_date_are_required(self):
         serializer = BorrowingCreateSerializer(data={})
         self.assertFalse(serializer.is_valid())
@@ -922,9 +1022,19 @@ class BorrowingCreateSerializerTests(TestCase):
             self.assertEqual(errors[0].code, 'required')
 
 
-@override_settings(TELEGRAM_BOT_TOKEN='test-token', TELEGRAM_CHAT_ID='12345')
+@override_settings(
+    TELEGRAM_BOT_TOKEN='test-token', TELEGRAM_CHAT_ID='12345', STRIPE_SECRET_KEY='',
+)
 class BorrowingCreateAPITests(APITestCase):
     def setUp(self):
+        self.session = SimpleNamespace(
+            id='cs_test_fake', url='https://checkout.stripe.com/c/pay/cs_test_fake',
+        )
+        self.checkout_patch = patch(
+            'borrowings.views.create_checkout_session', return_value=self.session,
+        )
+        self.checkout_mock = self.checkout_patch.start()
+        self.addCleanup(self.checkout_patch.stop)
         notify_patch = patch('borrowings.views.notify_borrowing_created')
         self.notify_mock = notify_patch.start()
         self.addCleanup(notify_patch.stop)
@@ -967,7 +1077,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(response.renderer_context['request'].user, self.user)
         self.assertEqual(Borrowing.objects.count(), 1)
         borrowing = Borrowing.objects.get(pk=response.data['id'])
-        self.assertEqual(response.data, {'id': borrowing.pk, **self.payload})
+        self.assertEqual(response.data, {
+            'id': borrowing.pk, **self.payload,
+            'payments': PaymentSerializer(borrowing.payments.all(), many=True).data,
+        })
         self.assertEqual(response.data, BorrowingCreateSerializer(borrowing).data)
         self.assertEqual(borrowing.book, self.book)
         self.assertEqual(borrowing.user, self.user)
@@ -1039,8 +1152,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.notify_mock.assert_not_called()
         self.assertEqual(response.status_code, 401)
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
+        self.checkout_mock.assert_not_called()
 
     def test_out_of_stock_returns_400_without_creating_borrowing(self):
         Book.objects.filter(pk=self.book.pk).update(inventory=0)
@@ -1051,8 +1166,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data, {'book': ['This book is out of stock.']})
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 0)
+        self.checkout_mock.assert_not_called()
 
     def test_past_expected_return_returns_400_without_decreasing_inventory(self):
         response = self.client.post(self.list_url, {
@@ -1062,8 +1179,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(set(response.data), {'expected_return_date'})
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
+        self.checkout_mock.assert_not_called()
 
     def test_insert_failure_rolls_back_without_registering_notification(self):
         def fail_insert(**kwargs):
@@ -1077,8 +1196,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(callbacks, [])
         self.notify_mock.assert_not_called()
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
+        self.checkout_mock.assert_not_called()
 
     def test_notification_waits_for_on_commit_callback(self):
         with self.captureOnCommitCallbacks(execute=False) as callbacks:
@@ -1090,6 +1211,7 @@ class BorrowingCreateAPITests(APITestCase):
 
         def check_persisted_state(borrowing):
             self.assertEqual(borrowing.pk, response.data['id'])
+            self.assertEqual(Payment.objects.filter(borrowing=borrowing).count(), 1)
             self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
             self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 1)
 
@@ -1107,6 +1229,7 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(callbacks, [])
         self.notify_mock.assert_not_called()
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
 
@@ -1120,7 +1243,10 @@ class BorrowingCreateAPITests(APITestCase):
                 with self.captureOnCommitCallbacks(execute=True) as callbacks:
                     response = self.client.post(self.list_url, self.payload, format='json')
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data, {'id': response.data['id'], **self.payload})
+        self.assertEqual(response.data, BorrowingCreateSerializer(
+            Borrowing.objects.get(pk=response.data['id']),
+        ).data)
+        self.assertEqual(Payment.objects.count(), 1)
         self.assertEqual(len(callbacks), 1)
         self.notify_mock.assert_called_once()
         send.assert_called_once()
@@ -1128,14 +1254,43 @@ class BorrowingCreateAPITests(APITestCase):
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 1)
 
-    def test_expected_return_today_is_accepted(self):
+    def assert_invalid_amount(self, days, fee):
+        Book.objects.filter(pk=self.book.pk).update(daily_fee=Decimal(fee))
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(self.list_url, {
+                **self.payload,
+                'expected_return_date': (self.today + timedelta(days=days)).isoformat(),
+            }, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {
+            'non_field_errors': ['Borrowing total must be at least $0.50.'],
+        })
+        self.assertEqual(callbacks, [])
+        self.notify_mock.assert_not_called()
+        self.checkout_mock.assert_not_called()
+        self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+
+    def test_expected_return_today_is_rejected(self):
+        self.assert_invalid_amount(0, '2.50')
+
+    def test_zero_daily_fee_is_rejected(self):
+        self.assert_invalid_amount(7, '0.00')
+
+    def test_ten_cents_is_rejected(self):
+        self.assert_invalid_amount(1, '0.10')
+
+    def test_fifty_cents_is_accepted(self):
+        Book.objects.filter(pk=self.book.pk).update(daily_fee=Decimal('0.50'))
         response = self.client.post(self.list_url, {
-            **self.payload, 'expected_return_date': self.today.isoformat(),
+            **self.payload,
+            'expected_return_date': (self.today + timedelta(days=1)).isoformat(),
         }, format='json')
         self.assertEqual(response.status_code, 201)
-        borrowing = Borrowing.objects.get(pk=response.data['id'])
-        self.assertEqual(borrowing.expected_return_date, self.today)
-        self.assertEqual(borrowing.borrow_date, self.today)
+        self.assertEqual(Payment.objects.get().money_to_pay, Decimal('0.50'))
+        self.checkout_mock.assert_called_once()
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 1)
 
@@ -1147,8 +1302,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(set(response.data), {'book'})
         self.assertEqual(response.data['book'][0].code, 'does_not_exist')
         self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
         self.book.refresh_from_db()
         self.assertEqual(self.book.inventory, 2)
+        self.checkout_mock.assert_not_called()
 
     def test_authenticated_user_cannot_update_or_delete_borrowing(self):
         response = self.client.post(self.list_url, self.payload, format='json')
@@ -1162,6 +1319,121 @@ class BorrowingCreateAPITests(APITestCase):
                 self.assertEqual(response.status_code, 405)
                 self.assertEqual(list(Borrowing.objects.order_by('pk').values()), original_borrowings)
                 self.assertEqual(list(Book.objects.order_by('pk').values()), original_books)
+
+    def test_success_creates_payment_and_uses_absolute_detail_urls(self):
+        def checkout(borrowing, **kwargs):
+            self.assertTrue(connection.in_atomic_block)
+            self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
+            self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 1)
+            self.assertFalse(Payment.objects.exists())
+            self.notify_mock.assert_not_called()
+            return self.session
+
+        self.checkout_mock.side_effect = checkout
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(self.list_url, self.payload, format='json')
+            self.notify_mock.assert_not_called()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Borrowing.objects.count(), 1)
+        self.assertEqual(Payment.objects.count(), 1)
+        borrowing = Borrowing.objects.get()
+        payment = Payment.objects.get()
+        expected_url = response.renderer_context['request'].build_absolute_uri(
+            reverse('borrowing-detail', args=[borrowing.pk]),
+        )
+        self.checkout_mock.assert_called_once_with(
+            borrowing, success_url=expected_url, cancel_url=expected_url,
+        )
+        self.assertEqual(payment.borrowing, borrowing)
+        self.assertEqual(payment.status, Payment.Status.PENDING)
+        self.assertEqual(payment.type, Payment.Type.PAYMENT)
+        self.assertEqual(payment.money_to_pay, Decimal('17.50'))
+        self.assertEqual(payment.session_id, self.session.id)
+        self.assertEqual(payment.session_url, self.session.url)
+        self.assertEqual(response.data['payments'], [PaymentSerializer(payment).data])
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 1)
+        self.assertEqual(len(callbacks), 1)
+        self.notify_mock.assert_called_once_with(borrowing)
+
+    def assert_failed_creation_rolled_back(self):
+        self.assertFalse(Borrowing.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 2)
+        self.notify_mock.assert_not_called()
+
+    def test_stripe_failure_rolls_back_database(self):
+        self.checkout_mock.side_effect = stripe.StripeError('forced Stripe failure')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertRaises(stripe.StripeError):
+                self.client.post(self.list_url, self.payload, format='json')
+        self.checkout_mock.assert_called_once()
+        self.assertEqual(callbacks, [])
+        self.assert_failed_creation_rolled_back()
+
+    def test_missing_configuration_rolls_back_database(self):
+        self.checkout_mock.side_effect = ImproperlyConfigured('Stripe is not configured.')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertRaises(ImproperlyConfigured):
+                self.client.post(self.list_url, self.payload, format='json')
+        self.checkout_mock.assert_called_once()
+        self.assertEqual(callbacks, [])
+        self.assert_failed_creation_rolled_back()
+
+    def test_payment_insert_failure_rolls_back_database(self):
+        def fail_payment(borrowing, session):
+            self.assertEqual(session, self.session)
+            self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
+            self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 1)
+            raise DatabaseError('forced Payment insert failure')
+
+        with patch('borrowings.views.create_payment_for_borrowing', side_effect=fail_payment) as create:
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                with self.assertRaises(DatabaseError):
+                    self.client.post(self.list_url, self.payload, format='json')
+        create.assert_called_once()
+        self.checkout_mock.assert_called_once()
+        self.assertEqual(callbacks, [])
+        self.assert_failed_creation_rolled_back()
+
+    def test_nested_payment_payload_cannot_control_persistence(self):
+        response = self.client.post(self.list_url, {
+            **self.payload,
+            'payments': [{
+                'status': 'PAID', 'type': 'FINE', 'money_to_pay': '0.01',
+                'session_id': 'injected', 'session_url': 'https://example.com/injected',
+            }],
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Payment.objects.count(), 1)
+        payment = Payment.objects.get()
+        self.assertEqual(payment.borrowing_id, response.data['id'])
+        self.assertEqual(payment.status, Payment.Status.PENDING)
+        self.assertEqual(payment.type, Payment.Type.PAYMENT)
+        self.assertEqual(payment.money_to_pay, Decimal('17.50'))
+        self.assertEqual(payment.session_id, self.session.id)
+        self.assertEqual(payment.session_url, self.session.url)
+        self.assertEqual(response.data['payments'], [PaymentSerializer(payment).data])
+
+    @override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+    def test_real_checkout_service_wiring_uses_equivalent_amount(self):
+        self.checkout_patch.stop()
+        with patch(
+            'payments.services.stripe.checkout.Session.create', return_value=self.session,
+        ) as checkout:
+            response = self.client.post(self.list_url, self.payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        checkout.assert_called_once()
+        item = checkout.call_args.kwargs['line_items'][0]
+        self.assertEqual(item['quantity'], 1)
+        self.assertEqual(item['price_data']['unit_amount'], 1750)
+        self.assertEqual(item['price_data']['currency'], 'usd')
+        payment = Payment.objects.get()
+        self.assertEqual(payment.money_to_pay, Decimal('17.50'))
+        self.assertEqual(convert_to_stripe_amount(payment.money_to_pay), 1750)
+        self.assertEqual(payment.session_id, self.session.id)
+        self.assertEqual(response.data['payments'], [PaymentSerializer(payment).data])
 
 
 class OverdueBorrowingTests(TestCase):
