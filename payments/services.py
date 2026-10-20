@@ -4,8 +4,11 @@ import stripe
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
+from payments.models import Payment
+
 
 STRIPE_CURRENCY = 'usd'
+STRIPE_MIN_AMOUNT = 50
 
 
 def calculate_borrowing_price(borrowing) -> Decimal:
@@ -18,6 +21,17 @@ def convert_to_stripe_amount(amount: Decimal) -> int:
     if minor != minor.to_integral_value():
         raise ValueError('Amount has more than 2 decimal places.')
     return int(minor)
+
+
+def create_payment_for_borrowing(borrowing, session) -> Payment:
+    return Payment.objects.create(
+        borrowing=borrowing,
+        money_to_pay=calculate_borrowing_price(borrowing),
+        session_url=session.url,
+        session_id=session.id,
+        status=Payment.Status.PENDING,
+        type=Payment.Type.PAYMENT,
+    )
 
 
 def create_checkout_session(borrowing, success_url, cancel_url):

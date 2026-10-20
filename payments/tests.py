@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -17,6 +18,7 @@ from payments.services import (
     calculate_borrowing_price,
     convert_to_stripe_amount,
     create_checkout_session,
+    create_payment_for_borrowing,
 )
 
 
@@ -154,6 +156,62 @@ class StripeCheckoutSessionTests(TestCase):
                 self.borrowing, self.success_url, self.cancel_url,
             )
         self.mock_create.assert_not_called()
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class CreatePaymentForBorrowingTests(TestCase):
+    def setUp(self):
+        user = get_user_model().objects.create_user(email='payment-helper@example.com')
+        self.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=5, daily_fee=Decimal('2.50'),
+        )
+        self.borrowing = Borrowing.objects.create(
+            user=user, book=self.book, borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 27),
+        )
+        self.session = SimpleNamespace(
+            id='cs_test_helper', url='https://checkout.stripe.com/c/pay/cs_test_helper',
+        )
+
+    @patch('payments.services.stripe.checkout.Session.create')
+    def test_creates_and_returns_one_payment_without_other_side_effects(self, checkout):
+        before = Borrowing.objects.values().get(pk=self.borrowing.pk)
+        count = Payment.objects.count()
+        with patch('notifications.services.send_telegram_message') as telegram:
+            result = create_payment_for_borrowing(self.borrowing, self.session)
+        self.assertEqual(Payment.objects.count(), count + 1)
+        payment = Payment.objects.get()
+        self.assertIsInstance(result, Payment)
+        self.assertEqual(result, payment)
+        self.assertEqual(payment.borrowing, self.borrowing)
+        self.assertEqual(payment.money_to_pay, Decimal('17.50'))
+        self.assertEqual(payment.session_id, self.session.id)
+        self.assertEqual(payment.session_url, self.session.url)
+        self.assertEqual(payment.status, Payment.Status.PENDING)
+        self.assertEqual(payment.type, Payment.Type.PAYMENT)
+        checkout.assert_not_called()
+        telegram.assert_not_called()
+        self.assertEqual(Borrowing.objects.values().get(pk=self.borrowing.pk), before)
+        for field, value in before.items():
+            self.assertEqual(getattr(self.borrowing, field), value)
+        self.assertEqual(self.borrowing.book.inventory, 5)
+        self.book.refresh_from_db()
+        self.assertEqual(self.book.inventory, 5)
+
+    @patch('payments.services.stripe.checkout.Session.create')
+    def test_payment_and_checkout_amounts_are_equivalent(self, checkout):
+        checkout.return_value = self.session
+        session = create_checkout_session(
+            self.borrowing, 'https://example.com/borrowing', 'https://example.com/borrowing',
+        )
+        payment = create_payment_for_borrowing(self.borrowing, session)
+        checkout.assert_called_once()
+        item = checkout.call_args.kwargs['line_items'][0]
+        self.assertEqual(item['price_data']['unit_amount'], 1750)
+        self.assertEqual(
+            convert_to_stripe_amount(payment.money_to_pay), item['price_data']['unit_amount'],
+        )
 
 
 class PaymentModelTests(TestCase):
