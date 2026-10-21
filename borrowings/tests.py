@@ -1320,7 +1320,7 @@ class BorrowingCreateAPITests(APITestCase):
                 self.assertEqual(list(Borrowing.objects.order_by('pk').values()), original_borrowings)
                 self.assertEqual(list(Book.objects.order_by('pk').values()), original_books)
 
-    def test_success_creates_payment_and_uses_absolute_detail_urls(self):
+    def test_success_creates_payment_and_uses_absolute_checkout_urls(self):
         def checkout(borrowing, **kwargs):
             self.assertTrue(connection.in_atomic_block)
             self.assertTrue(Borrowing.objects.filter(pk=borrowing.pk).exists())
@@ -1342,8 +1342,14 @@ class BorrowingCreateAPITests(APITestCase):
             reverse('borrowing-detail', args=[borrowing.pk]),
         )
         self.checkout_mock.assert_called_once_with(
-            borrowing, success_url=expected_url, cancel_url=expected_url,
+            borrowing,
+            success_url='http://testserver/payments/success/?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url=expected_url,
         )
+        success_url = self.checkout_mock.call_args.kwargs['success_url']
+        self.assertIn('{CHECKOUT_SESSION_ID}', success_url)
+        self.assertNotIn('%7B', success_url)
+        self.assertNotIn('%7D', success_url)
         self.assertEqual(payment.borrowing, borrowing)
         self.assertEqual(payment.status, Payment.Status.PENDING)
         self.assertEqual(payment.type, Payment.Type.PAYMENT)
@@ -1425,6 +1431,18 @@ class BorrowingCreateAPITests(APITestCase):
             response = self.client.post(self.list_url, self.payload, format='json')
         self.assertEqual(response.status_code, 201)
         checkout.assert_called_once()
+        success_url = checkout.call_args.kwargs['success_url']
+        self.assertEqual(
+            success_url,
+            'http://testserver/payments/success/?session_id={CHECKOUT_SESSION_ID}',
+        )
+        self.assertIn('{CHECKOUT_SESSION_ID}', success_url)
+        self.assertNotIn('%7B', success_url)
+        self.assertNotIn('%7D', success_url)
+        self.assertEqual(
+            checkout.call_args.kwargs['cancel_url'],
+            f'http://testserver/borrowings/{response.data["id"]}/',
+        )
         item = checkout.call_args.kwargs['line_items'][0]
         self.assertEqual(item['quantity'], 1)
         self.assertEqual(item['price_data']['unit_amount'], 1750)
