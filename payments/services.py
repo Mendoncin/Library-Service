@@ -11,6 +11,16 @@ STRIPE_CURRENCY = 'usd'
 STRIPE_MIN_AMOUNT = 50
 
 
+def retrieve_checkout_session(session_id: str):
+    if not settings.STRIPE_SECRET_KEY:
+        raise ImproperlyConfigured('Stripe is not configured.')
+
+    return stripe.checkout.Session.retrieve(
+        session_id,
+        api_key=settings.STRIPE_SECRET_KEY,
+    )
+
+
 def calculate_borrowing_price(borrowing) -> Decimal:
     days = (borrowing.expected_return_date - borrowing.borrow_date).days
     return days * borrowing.book.daily_fee
