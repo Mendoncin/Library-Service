@@ -1338,13 +1338,10 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(Payment.objects.count(), 1)
         borrowing = Borrowing.objects.get()
         payment = Payment.objects.get()
-        expected_url = response.renderer_context['request'].build_absolute_uri(
-            reverse('borrowing-detail', args=[borrowing.pk]),
-        )
         self.checkout_mock.assert_called_once_with(
             borrowing,
             success_url='http://testserver/payments/success/?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url=expected_url,
+            cancel_url='http://testserver/payments/cancel/',
         )
         success_url = self.checkout_mock.call_args.kwargs['success_url']
         self.assertIn('{CHECKOUT_SESSION_ID}', success_url)
@@ -1441,7 +1438,7 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertNotIn('%7D', success_url)
         self.assertEqual(
             checkout.call_args.kwargs['cancel_url'],
-            f'http://testserver/borrowings/{response.data["id"]}/',
+            'http://testserver/payments/cancel/',
         )
         item = checkout.call_args.kwargs['line_items'][0]
         self.assertEqual(item['quantity'], 1)
@@ -1452,6 +1449,33 @@ class BorrowingCreateAPITests(APITestCase):
         self.assertEqual(convert_to_stripe_amount(payment.money_to_pay), 1750)
         self.assertEqual(payment.session_id, self.session.id)
         self.assertEqual(response.data['payments'], [PaymentSerializer(payment).data])
+
+    @override_settings(
+        ALLOWED_HOSTS=['api.example.test'], STRIPE_SECRET_KEY='sk_test_fake',
+    )
+    def test_checkout_urls_use_current_request_host_and_https(self):
+        self.checkout_patch.stop()
+        with patch(
+            'payments.services.stripe.checkout.Session.create', return_value=self.session,
+        ) as checkout:
+            response = self.client.post(
+                self.list_url, self.payload, format='json',
+                HTTP_HOST='api.example.test', secure=True,
+            )
+        self.assertEqual(response.status_code, 201)
+        checkout.assert_called_once()
+        success_url = checkout.call_args.kwargs['success_url']
+        self.assertEqual(
+            success_url,
+            'https://api.example.test/payments/success/?session_id={CHECKOUT_SESSION_ID}',
+        )
+        self.assertEqual(
+            checkout.call_args.kwargs['cancel_url'],
+            'https://api.example.test/payments/cancel/',
+        )
+        self.assertIn('{CHECKOUT_SESSION_ID}', success_url)
+        self.assertNotIn('%7B', success_url)
+        self.assertNotIn('%7D', success_url)
 
 
 class OverdueBorrowingTests(TestCase):
