@@ -64,11 +64,15 @@ class BorrowingViewSet(
     def perform_create(self, serializer):
         with transaction.atomic():
             borrowing = serializer.save(user=self.request.user)
-            borrowing_url = self.request.build_absolute_uri(
-                reverse('borrowing-detail', args=[borrowing.pk]),
+            cancel_url = self.request.build_absolute_uri(
+                reverse('payment-cancel'),
             )
+            success_base_url = self.request.build_absolute_uri(
+                reverse('payment-success'),
+            )
+            success_url = success_base_url + '?session_id={CHECKOUT_SESSION_ID}'
             session = create_checkout_session(
-                borrowing, success_url=borrowing_url, cancel_url=borrowing_url,
+                borrowing, success_url=success_url, cancel_url=cancel_url,
             )
             create_payment_for_borrowing(borrowing, session)
             transaction.on_commit(lambda: notify_borrowing_created(borrowing))
