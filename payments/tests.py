@@ -3,11 +3,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import stripe
+
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models.deletion import ProtectedError
 from django.test import SimpleTestCase, TestCase, override_settings
-from django.urls import reverse
+from django.urls import resolve, reverse
 from rest_framework.test import APITestCase
 
 from books.models import Book
@@ -19,7 +21,331 @@ from payments.services import (
     convert_to_stripe_amount,
     create_checkout_session,
     create_payment_for_borrowing,
+    retrieve_checkout_session,
 )
+from payments.urls import urlpatterns
+from payments.views import PaymentViewSet
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class RetrieveCheckoutSessionTests(SimpleTestCase):
+    @patch('payments.services.stripe.checkout.Session.retrieve')
+    def test_retrieve_returns_session_with_explicit_api_key(self, retrieve):
+        session = SimpleNamespace(id='cs_test_retrieve', payment_status='paid')
+        retrieve.return_value = session
+        self.assertIs(retrieve_checkout_session(session.id), session)
+        retrieve.assert_called_once_with(session.id, api_key='sk_test_fake')
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    @patch('payments.services.stripe.checkout.Session.retrieve')
+    def test_empty_secret_fails_before_stripe(self, retrieve):
+        with self.assertRaisesMessage(ImproperlyConfigured, 'Stripe is not configured.'):
+            retrieve_checkout_session('cs_test_retrieve')
+        retrieve.assert_not_called()
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class PaymentSuccessTests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = get_user_model().objects.create_user(email='success@example.com')
+        book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        borrowing = Borrowing.objects.create(
+            user=cls.user, book=book, borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 25),
+        )
+        cls.payment = Payment.objects.create(
+            borrowing=borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('12.50'), session_id='cs_test_success',
+            session_url='https://checkout.stripe.com/c/pay/cs_test_success',
+        )
+        cls.other_payment = Payment.objects.create(
+            borrowing=borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('5.00'), session_id='cs_test_other',
+        )
+
+    def setUp(self):
+        self.url = reverse('payment-success')
+        retrieve_patch = patch('payments.services.stripe.checkout.Session.retrieve')
+        self.retrieve = retrieve_patch.start()
+        self.addCleanup(retrieve_patch.stop)
+        self.retrieve.return_value = SimpleNamespace(
+            id=self.payment.session_id, payment_status='paid',
+        )
+        telegram_patch = patch('notifications.services.send_telegram_message')
+        self.telegram = telegram_patch.start()
+        self.addCleanup(telegram_patch.stop)
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        self.borrowings_before = list(Borrowing.objects.order_by('pk').values())
+        self.books_before = list(Book.objects.order_by('pk').values())
+
+    def request_success(self, **params):
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.get(self.url, {
+                'session_id': self.payment.session_id, **params,
+            })
+        self.assertEqual(callbacks, [])
+        return response
+
+    def assert_state(self, status=Payment.Status.PENDING):
+        expected = [dict(row) for row in self.payments_before]
+        for row in expected:
+            if row['id'] == self.payment.pk:
+                row['status'] = status
+        self.assertEqual(list(Payment.objects.order_by('pk').values()), expected)
+        self.assertEqual(list(Borrowing.objects.order_by('pk').values()), self.borrowings_before)
+        self.assertEqual(list(Book.objects.order_by('pk').values()), self.books_before)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, status)
+        self.telegram.assert_not_called()
+
+    def assert_confirmed(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            'detail': 'Payment confirmed.', 'status': 'PAID',
+        })
+        self.assert_state(Payment.Status.PAID)
+
+    def assert_unconfirmed(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            'detail': 'Payment has not been confirmed.', 'status': 'PENDING',
+        })
+        self.retrieve.assert_called_once_with(
+            self.payment.session_id, api_key='sk_test_fake',
+        )
+        self.assert_state()
+
+    def test_anonymous_missing_session_returns_exact_validation_error(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {
+            'session_id': ['This query parameter is required.'],
+        })
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+    def test_empty_and_whitespace_session_returns_validation_error(self):
+        for query in ('?session_id=', '?session_id=%20'):
+            with self.subTest(query=query):
+                response = self.client.get(self.url + query)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), {
+                    'session_id': ['This query parameter is required.'],
+                })
+                self.retrieve.assert_not_called()
+                self.assert_state()
+
+    def test_unknown_local_payment_does_not_call_stripe(self):
+        response = self.request_success(session_id='cs_test_unknown')
+        self.assertEqual(response.status_code, 404)
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+    def test_fine_session_does_not_call_stripe(self):
+        Payment.objects.filter(pk=self.payment.pk).update(type=Payment.Type.FINE)
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        response = self.request_success()
+        self.assertEqual(response.status_code, 404)
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+    def test_anonymous_paid_session_updates_only_matching_payment_status(self):
+        self.assert_confirmed(self.request_success())
+        self.retrieve.assert_called_once_with(
+            self.payment.session_id, api_key='sk_test_fake',
+        )
+
+    def test_authenticated_success(self):
+        self.client.force_authenticate(user=self.user)
+        self.assert_confirmed(self.request_success())
+
+    def test_session_id_is_trimmed(self):
+        self.assert_confirmed(self.request_success(
+            session_id=f' {self.payment.session_id} ',
+        ))
+        self.retrieve.assert_called_once_with(
+            self.payment.session_id, api_key='sk_test_fake',
+        )
+
+    def test_unpaid_remains_pending(self):
+        self.retrieve.return_value.payment_status = 'unpaid'
+        self.assert_unconfirmed(self.request_success())
+
+    def test_no_payment_required_remains_pending(self):
+        self.retrieve.return_value.payment_status = 'no_payment_required'
+        self.assert_unconfirmed(self.request_success())
+
+    def test_complete_but_unpaid_remains_pending(self):
+        self.retrieve.return_value.status = 'complete'
+        self.retrieve.return_value.payment_status = 'unpaid'
+        self.assert_unconfirmed(self.request_success())
+
+    def test_browser_payment_status_is_ignored(self):
+        self.retrieve.return_value.payment_status = 'unpaid'
+        self.assert_unconfirmed(self.request_success(
+            paid='true', payment_status='paid', status='complete',
+        ))
+
+    def test_stripe_error_propagates_without_side_effects(self):
+        self.retrieve.side_effect = stripe.StripeError('boom')
+        with self.assertRaisesMessage(stripe.StripeError, 'boom'):
+            self.request_success()
+        self.assert_state()
+
+    def test_invalid_stripe_session_propagates_without_side_effects(self):
+        self.retrieve.side_effect = stripe.InvalidRequestError('No such session', 'id')
+        with self.assertRaises(stripe.InvalidRequestError):
+            self.request_success()
+        self.assert_state()
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_missing_configuration_preserves_pending_payment(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, 'Stripe is not configured.'):
+            self.request_success()
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_already_paid_returns_immediately_even_without_stripe_configuration(self):
+        Payment.objects.filter(pk=self.payment.pk).update(status=Payment.Status.PAID)
+        self.assert_confirmed(self.request_success())
+        self.retrieve.assert_not_called()
+
+    def test_repeated_success_retrieves_only_once(self):
+        self.assert_confirmed(self.request_success())
+        self.assert_confirmed(self.request_success())
+        self.retrieve.assert_called_once_with(
+            self.payment.session_id, api_key='sk_test_fake',
+        )
+
+    def test_duplicate_session_id_exposes_inconsistency_before_stripe(self):
+        Payment.objects.filter(pk=self.other_payment.pk).update(
+            session_id=self.payment.session_id,
+        )
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        with self.assertRaises(Payment.MultipleObjectsReturned):
+            self.request_success()
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+    def test_concurrent_confirmation_between_lookup_and_update_is_benign(self):
+        from django.db.models.query import QuerySet
+
+        original_update = QuerySet.update
+        updates = []
+
+        def record_update(queryset, **kwargs):
+            affected = original_update(queryset, **kwargs)
+            updates.append((kwargs, affected))
+            return affected
+
+        def concurrent_confirmation(*args, **kwargs):
+            Payment.objects.filter(pk=self.payment.pk).update(status=Payment.Status.PAID)
+            return SimpleNamespace(payment_status='paid')
+
+        self.retrieve.side_effect = concurrent_confirmation
+        with patch.object(QuerySet, 'update', autospec=True, side_effect=record_update):
+            self.assert_confirmed(self.request_success())
+        self.assertEqual(updates, [
+            ({'status': Payment.Status.PAID}, 1),
+            ({'status': Payment.Status.PAID}, 0),
+        ])
+
+    def test_success_rejects_write_methods(self):
+        self.client.force_authenticate(user=self.user)
+        for method in ('post', 'put', 'patch', 'delete'):
+            with self.subTest(method=method):
+                response = getattr(self.client, method)(self.url)
+                self.assertEqual(response.status_code, 405)
+        self.retrieve.assert_not_called()
+        self.assert_state()
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class PaymentCancelTests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = get_user_model().objects.create_user(email='cancel@example.com')
+        book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        borrowing = Borrowing.objects.create(
+            user=cls.user, book=book, borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 25),
+        )
+        Payment.objects.create(
+            borrowing=borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('12.50'), session_id='cs_test_cancel',
+            session_url='https://checkout.stripe.com/c/pay/cs_test_cancel',
+        )
+
+    def setUp(self):
+        self.url = reverse('payment-cancel')
+        self.expected_body = {
+            'detail': (
+                'Payment was not completed. You can still pay later using the same '
+                'checkout link while the Stripe Checkout Session remains active; '
+                'sessions expire after a limited time.'
+            ),
+        }
+        self.external_calls = []
+        for target in (
+            'payments.services.stripe.checkout.Session.retrieve',
+            'payments.services.stripe.checkout.Session.create',
+            'payments.services.stripe.checkout.Session.expire',
+            'notifications.services.send_telegram_message',
+        ):
+            patcher = patch(target)
+            self.external_calls.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        self.borrowings_before = list(Borrowing.objects.order_by('pk').values())
+        self.books_before = list(Book.objects.order_by('pk').values())
+
+    def assert_no_side_effects(self):
+        self.assertEqual(list(Payment.objects.order_by('pk').values()), self.payments_before)
+        self.assertEqual(list(Borrowing.objects.order_by('pk').values()), self.borrowings_before)
+        self.assertEqual(list(Book.objects.order_by('pk').values()), self.books_before)
+        for mock in self.external_calls:
+            mock.assert_not_called()
+
+    def test_anonymous_repeated_cancel_is_informative_without_queries_or_side_effects(self):
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertNumQueries(0):
+                first = self.client.get(self.url)
+                second = self.client.get(self.url)
+        self.assertEqual(callbacks, [])
+        for response in (first, second):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), self.expected_body)
+        self.assert_no_side_effects()
+
+    def test_authenticated_cancel_is_informative_without_queries_or_side_effects(self):
+        self.client.force_authenticate(user=self.user)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertNumQueries(0):
+                response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), self.expected_body)
+        self.assertEqual(callbacks, [])
+        self.assert_no_side_effects()
+
+    def test_cancel_write_methods_are_not_allowed(self):
+        for user in (None, self.user):
+            self.client.force_authenticate(user=user)
+            for method in ('post', 'put', 'patch', 'delete'):
+                with self.subTest(authenticated=user is not None, method=method):
+                    with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                        with self.assertNumQueries(0):
+                            response = getattr(self.client, method)(self.url)
+                    self.assertEqual(response.status_code, 405)
+                    self.assertEqual(callbacks, [])
+                    self.assert_no_side_effects()
 
 
 class BorrowingPriceTests(SimpleTestCase):
@@ -547,3 +873,25 @@ class PaymentAPITests(APITestCase):
     def test_route_paths(self):
         self.assertEqual(self.list_url, '/payments/')
         self.assertEqual(self.detail_url, f'/payments/{self.payment_a.pk}/')
+        success_url = reverse('payment-success')
+        self.assertEqual(success_url, '/payments/success/')
+        cancel_url = reverse('payment-cancel')
+        self.assertEqual(cancel_url, '/payments/cancel/')
+        self.assertEqual(resolve(cancel_url).url_name, 'payment-cancel')
+        self.assertEqual(resolve(cancel_url).kwargs, {})
+        self.assertEqual(len(urlpatterns), 4)
+        self.assertEqual([pattern.name for pattern in urlpatterns], [
+            'payment-list', 'payment-cancel', 'payment-success', 'payment-detail',
+        ])
+        for url, action in (
+            (self.list_url, 'list'), (cancel_url, 'cancel'), (success_url, 'success'),
+            (self.detail_url, 'retrieve'),
+        ):
+            with self.subTest(url=url):
+                match = resolve(url)
+                self.assertIs(match.func.cls, PaymentViewSet)
+                self.assertEqual(
+                    {method: value for method, value in match.func.actions.items()
+                     if method != 'head'},
+                    {'get': action},
+                )
