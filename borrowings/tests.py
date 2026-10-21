@@ -30,6 +30,204 @@ from payments.serializers import PaymentSerializer
 from payments.services import convert_to_stripe_amount
 
 
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class BorrowingFineReturnTests(APITestCase):
+    def setUp(self):
+        self.today = date(2026, 10, 21)
+        date_patch = patch('borrowings.views.timezone.localdate', return_value=self.today)
+        self.localdate = date_patch.start()
+        self.addCleanup(date_patch.stop)
+        self.user = get_user_model().objects.create_user(email='fine-return@example.com')
+        self.client.force_authenticate(self.user)
+        self.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        self.borrowing = Borrowing.objects.create(
+            user=self.user, book=self.book, borrow_date=date(2026, 10, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+        self.original_payment = Payment.objects.create(
+            borrowing=self.borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('47.50'), status=Payment.Status.PAID,
+            session_id='cs_test_original', session_url='https://example.com/original',
+        )
+        self.original_state = Payment.objects.values().get(pk=self.original_payment.pk)
+        self.url = reverse('borrowing-return', args=[self.borrowing.pk])
+        self.session = SimpleNamespace(
+            id='cs_test_fine', url='https://checkout.stripe.com/c/pay/cs_test_fine',
+        )
+        create_patch = patch('payments.services.stripe.checkout.Session.create')
+        self.create = create_patch.start()
+        self.addCleanup(create_patch.stop)
+        self.create.side_effect = self.checkout_after_return_update
+
+    def checkout_after_return_update(self, **kwargs):
+        self.assertTrue(connection.in_atomic_block)
+        self.assertEqual(
+            Borrowing.objects.get(pk=self.borrowing.pk).actual_return_date, self.today,
+        )
+        self.assertEqual(Book.objects.get(pk=self.book.pk).inventory, 3)
+        self.assertFalse(Payment.objects.filter(type=Payment.Type.FINE).exists())
+        return self.session
+
+    def assert_original_unchanged(self):
+        self.assertEqual(
+            Payment.objects.values().get(pk=self.original_payment.pk), self.original_state,
+        )
+
+    def assert_returned(self):
+        self.borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.localdate.return_value)
+        self.assertEqual(self.book.inventory, 3)
+        self.assert_original_unchanged()
+
+    def assert_rolled_back(self):
+        self.borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertIsNone(self.borrowing.actual_return_date)
+        self.assertEqual(self.book.inventory, 2)
+        self.assertFalse(Payment.objects.filter(type=Payment.Type.FINE).exists())
+        self.assert_original_unchanged()
+
+    def assert_non_overdue_return(self, return_date):
+        self.localdate.return_value = return_date
+        with patch('borrowings.views.create_fine_checkout_session') as fine_checkout:
+            response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assert_returned()
+        self.assertEqual(Payment.objects.count(), 1)
+        fine_checkout.assert_not_called()
+        self.create.assert_not_called()
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_on_time_return_needs_no_key_or_fine(self):
+        self.assert_non_overdue_return(self.borrowing.expected_return_date)
+
+    def test_early_return_has_no_fine(self):
+        self.assert_non_overdue_return(date(2026, 10, 19))
+
+    def test_late_return_creates_one_fine_and_exposes_fresh_ordered_payments(self):
+        response = self.client.post(self.url, {
+            'actual_return_date': '2026-10-19',
+            'payments': [{'type': 'FINE', 'status': 'PAID', 'money_to_pay': '0.01'}],
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assert_returned()
+        self.assertEqual(Payment.objects.count(), 2)
+        fine = Payment.objects.get(type=Payment.Type.FINE)
+        self.assertEqual(fine.borrowing, self.borrowing)
+        self.assertEqual(fine.money_to_pay, Decimal('5.00'))
+        self.assertEqual(fine.status, Payment.Status.PENDING)
+        self.assertEqual(fine.session_id, self.session.id)
+        self.assertEqual(fine.session_url, self.session.url)
+        self.create.assert_called_once()
+        payload = self.create.call_args.kwargs
+        self.assertEqual(payload['line_items'][0]['price_data']['unit_amount'], 500)
+        self.assertEqual(payload['api_key'], 'sk_test_fake')
+        self.assertEqual(
+            payload['success_url'],
+            'http://testserver/payments/success/?session_id={CHECKOUT_SESSION_ID}',
+        )
+        self.assertEqual(payload['cancel_url'], 'http://testserver/payments/cancel/')
+        expected = PaymentSerializer([self.original_payment, fine], many=True).data
+        self.assertEqual(response.data['payments'], expected)
+        detail = self.client.get(reverse('borrowing-detail', args=[self.borrowing.pk]))
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data['payments'], expected)
+        listing = self.client.get(reverse('borrowing-list'))
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data[0]['payments'], expected)
+
+    def test_duplicate_late_return_has_no_additional_side_effects(self):
+        self.assertEqual(self.client.post(self.url).status_code, 200)
+        payments_before = list(Payment.objects.order_by('id').values())
+        self.localdate.return_value = date(2026, 10, 22)
+        self.assertEqual(self.client.post(self.url).status_code, 409)
+        self.borrowing.refresh_from_db()
+        self.book.refresh_from_db()
+        self.assertEqual(self.borrowing.actual_return_date, self.today)
+        self.assertEqual(self.book.inventory, 3)
+        self.assertEqual(list(Payment.objects.order_by('id').values()), payments_before)
+        self.assertEqual(Payment.objects.filter(type=Payment.Type.FINE).count(), 1)
+        self.create.assert_called_once()
+
+    def test_stripe_failure_rolls_back_return_inventory_and_fine(self):
+        self.create.side_effect = stripe.StripeError('forced Stripe failure')
+        with self.assertRaises(stripe.StripeError):
+            self.client.post(self.url)
+        self.create.assert_called_once()
+        self.assert_rolled_back()
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_missing_key_rolls_back_late_return(self):
+        with self.assertRaises(ImproperlyConfigured):
+            self.client.post(self.url)
+        self.create.assert_not_called()
+        self.assert_rolled_back()
+
+    def test_fine_insert_failure_rolls_back_after_external_session_created(self):
+        def fail_insert(borrowing, amount, session):
+            self.assertEqual(session, self.session)
+            self.assertEqual(amount, Decimal('5.00'))
+            self.assertEqual(borrowing.pk, self.borrowing.pk)
+            self.create.assert_called_once()
+            raise DatabaseError('forced fine insert failure')
+
+        with patch('borrowings.views.create_fine_payment', side_effect=fail_insert) as create:
+            with self.assertRaises(DatabaseError):
+                self.client.post(self.url)
+        create.assert_called_once()
+        self.create.assert_called_once()
+        self.assert_rolled_back()
+        # The external Stripe Session may be orphaned; no compensation is attempted.
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_low_fine_is_persisted_exactly_without_stripe_or_key(self):
+        Book.objects.filter(pk=self.book.pk).update(daily_fee=Decimal('0.10'))
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assert_returned()
+        self.create.assert_not_called()
+        self.assertEqual(Payment.objects.count(), 2)
+        fine = Payment.objects.get(type=Payment.Type.FINE)
+        self.assertEqual(fine.money_to_pay, Decimal('0.20'))
+        self.assertEqual(fine.status, Payment.Status.PENDING)
+        self.assertEqual(fine.borrowing, self.borrowing)
+        self.assertEqual(fine.session_id, '')
+        self.assertEqual(fine.session_url, '')
+        self.assertEqual(response.data['payments'], PaymentSerializer(
+            [self.original_payment, fine], many=True,
+        ).data)
+
+    def test_fifty_cent_fine_calls_stripe(self):
+        Book.objects.filter(pk=self.book.pk).update(daily_fee=Decimal('0.25'))
+        self.assertEqual(self.client.post(self.url).status_code, 200)
+        self.assert_returned()
+        self.create.assert_called_once()
+        self.assertEqual(
+            self.create.call_args.kwargs['line_items'][0]['price_data']['unit_amount'], 50,
+        )
+        self.assertEqual(
+            Payment.objects.get(type=Payment.Type.FINE).money_to_pay, Decimal('0.50'),
+        )
+
+    @override_settings(ALLOWED_HOSTS=['api.example.test'])
+    def test_fine_checkout_urls_follow_request_host_and_https(self):
+        response = self.client.post(self.url, HTTP_HOST='api.example.test', secure=True)
+        self.assertEqual(response.status_code, 200)
+        self.create.assert_called_once()
+        self.assertEqual(
+            self.create.call_args.kwargs['success_url'],
+            'https://api.example.test/payments/success/?session_id={CHECKOUT_SESSION_ID}',
+        )
+        self.assertEqual(
+            self.create.call_args.kwargs['cancel_url'],
+            'https://api.example.test/payments/cancel/',
+        )
+
+
 class BorrowingTests(TestCase):
     def setUp(self):
         self.book = Book.objects.create(
@@ -592,8 +790,15 @@ class BorrowingReadTests(APITestCase):
         self.assertEqual(sum('payments_payment' in q['sql'] for q in three), 1)
 
 
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
 class BorrowingReturnAPITests(APITestCase):
     def setUp(self):
+        checkout_patch = patch(
+            'payments.services.stripe.checkout.Session.create',
+            side_effect=AssertionError('Unexpected Stripe call in return regression test'),
+        )
+        self.fine_stripe = checkout_patch.start()
+        self.addCleanup(checkout_patch.stop)
         self.today = date(2026, 10, 15)
         date_patch = patch('borrowings.views.timezone.localdate', return_value=self.today)
         self.localdate = date_patch.start()
@@ -807,8 +1012,9 @@ class BorrowingReturnAPITests(APITestCase):
         self.assertEqual(self.book.inventory, inventory_before)
 
     def test_conditional_update_rejects_return_completed_after_lookup(self):
+        self.localdate.return_value = self.borrowing.expected_return_date + timedelta(days=2)
         inventory_before = self.book.inventory
-        concurrent_date = self.today - timedelta(days=1)
+        concurrent_date = self.localdate.return_value - timedelta(days=1)
         original_get_object = BorrowingViewSet.get_object
 
         def get_object_then_concurrent_return(view):
@@ -831,6 +1037,8 @@ class BorrowingReturnAPITests(APITestCase):
         self.book.refresh_from_db()
         self.assertEqual(self.borrowing.actual_return_date, concurrent_date)
         self.assertEqual(self.book.inventory, inventory_before)
+        self.assertFalse(Payment.objects.filter(type=Payment.Type.FINE).exists())
+        self.fine_stripe.assert_not_called()
 
     def test_other_users_already_returned_borrowing_stays_invisible(self):
         original_date = date(2026, 10, 10)

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import stripe
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models.deletion import ProtectedError
@@ -18,13 +19,146 @@ from payments.models import Payment
 from payments.serializers import PaymentSerializer
 from payments.services import (
     calculate_borrowing_price,
+    calculate_fine_amount,
+    calculate_overdue_days,
     convert_to_stripe_amount,
     create_checkout_session,
+    create_fine_checkout_session,
+    create_fine_payment,
     create_payment_for_borrowing,
     retrieve_checkout_session,
 )
 from payments.urls import urlpatterns
 from payments.views import PaymentViewSet
+
+
+class FineCalculationTests(SimpleTestCase):
+    def setUp(self):
+        self.borrowing = Borrowing(
+            book=Book(daily_fee=Decimal('2.50')),
+            borrow_date=date(2026, 1, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+
+    def test_fixed_multiplier_is_integer_two(self):
+        self.assertEqual(settings.FINE_MULTIPLIER, 2)
+        self.assertIs(type(settings.FINE_MULTIPLIER), int)
+
+    def test_days_and_amount_boundaries(self):
+        for day, days, amount in (
+            (19, 0, '0.00'), (20, 0, '0.00'),
+            (21, 1, '5.00'), (23, 3, '15.00'),
+        ):
+            with self.subTest(day=day):
+                result = calculate_overdue_days(self.borrowing, date(2026, 10, day))
+                self.assertEqual(result, days)
+                self.assertIs(type(result), int)
+                fine = calculate_fine_amount(self.borrowing, date(2026, 10, day))
+                self.assertEqual(fine, Decimal(amount))
+                self.assertIsInstance(fine, Decimal)
+
+    def test_three_days_at_one_seventy_five(self):
+        self.borrowing.book.daily_fee = Decimal('1.75')
+        self.assertEqual(
+            calculate_fine_amount(self.borrowing, date(2026, 10, 23)),
+            Decimal('10.50'),
+        )
+
+    def test_fine_is_independent_of_borrow_period(self):
+        for borrow_date in (date(2026, 1, 1), date(2026, 10, 19)):
+            self.borrowing.borrow_date = borrow_date
+            self.assertEqual(
+                calculate_fine_amount(self.borrowing, date(2026, 10, 21)),
+                Decimal('5.00'),
+            )
+
+    @override_settings(FINE_MULTIPLIER=3)
+    def test_multiplier_is_read_at_call_time(self):
+        self.assertEqual(
+            calculate_fine_amount(self.borrowing, date(2026, 10, 21)),
+            Decimal('7.50'),
+        )
+
+
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class FineCheckoutTests(SimpleTestCase):
+    def setUp(self):
+        self.borrowing = Borrowing(book=Book(title='Book'))
+        create_patch = patch('payments.services.stripe.checkout.Session.create')
+        self.create = create_patch.start()
+        self.addCleanup(create_patch.stop)
+
+    def test_fine_payload_and_return(self):
+        session = SimpleNamespace(id='cs_test_fine', url='https://example.com/fine')
+        self.create.return_value = session
+        result = create_fine_checkout_session(
+            self.borrowing, Decimal('10.50'),
+            'https://example.com/success', 'https://example.com/cancel',
+        )
+        self.assertIs(result, session)
+        self.create.assert_called_once_with(
+            api_key='sk_test_fake', mode='payment',
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd', 'unit_amount': 1050,
+                    'product_data': {'name': 'Fine for Book'},
+                },
+                'quantity': 1,
+            }],
+            success_url='https://example.com/success',
+            cancel_url='https://example.com/cancel',
+        )
+
+    @override_settings(STRIPE_SECRET_KEY='')
+    def test_empty_secret_prevents_stripe_call(self):
+        with self.assertRaises(ImproperlyConfigured):
+            create_fine_checkout_session(
+                self.borrowing, Decimal('10.50'), 'https://example.com/success',
+                'https://example.com/cancel',
+            )
+        self.create.assert_not_called()
+
+
+class CreateFinePaymentTests(TestCase):
+    def setUp(self):
+        user = get_user_model().objects.create_user(email='fine-helper@example.com')
+        self.book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        self.borrowing = Borrowing.objects.create(
+            user=user, book=self.book, borrow_date=date(2026, 10, 1),
+            expected_return_date=date(2026, 10, 20),
+        )
+
+    def assert_fine_created(self, amount, session=None):
+        books_before = list(Book.objects.values())
+        borrowings_before = list(Borrowing.objects.values())
+        count = Payment.objects.count()
+        with patch('payments.services.stripe.checkout.Session.create') as checkout:
+            with patch('notifications.services.send_telegram_message') as telegram:
+                fine = create_fine_payment(self.borrowing, amount, session)
+        self.assertEqual(Payment.objects.count(), count + 1)
+        self.assertEqual(fine, Payment.objects.get())
+        self.assertEqual(fine.borrowing, self.borrowing)
+        self.assertEqual(fine.money_to_pay, amount)
+        self.assertEqual(fine.type, Payment.Type.FINE)
+        self.assertEqual(fine.status, Payment.Status.PENDING)
+        self.assertEqual(fine.session_id, session.id if session else '')
+        self.assertEqual(fine.session_url, session.url if session else '')
+        self.assertEqual(list(Book.objects.values()), books_before)
+        self.assertEqual(list(Borrowing.objects.values()), borrowings_before)
+        checkout.assert_not_called()
+        telegram.assert_not_called()
+
+    def test_creates_one_fine_with_session_without_other_side_effects(self):
+        self.assert_fine_created(
+            Decimal('5.00'),
+            SimpleNamespace(id='cs_test_fine', url='https://example.com/fine'),
+        )
+
+    def test_creates_low_fine_without_session(self):
+        self.assert_fine_created(Decimal('0.20'))
 
 
 @override_settings(STRIPE_SECRET_KEY='sk_test_fake')
@@ -145,13 +279,19 @@ class PaymentSuccessTests(APITestCase):
         self.retrieve.assert_not_called()
         self.assert_state()
 
-    def test_fine_session_does_not_call_stripe(self):
+    def test_paid_fine_session_updates_only_matching_fine(self):
         Payment.objects.filter(pk=self.payment.pk).update(type=Payment.Type.FINE)
         self.payments_before = list(Payment.objects.order_by('pk').values())
-        response = self.request_success()
-        self.assertEqual(response.status_code, 404)
-        self.retrieve.assert_not_called()
-        self.assert_state()
+        self.assert_confirmed(self.request_success())
+        self.retrieve.assert_called_once_with(
+            self.payment.session_id, api_key='sk_test_fake',
+        )
+
+    def test_unpaid_fine_session_remains_pending(self):
+        Payment.objects.filter(pk=self.payment.pk).update(type=Payment.Type.FINE)
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        self.retrieve.return_value.payment_status = 'unpaid'
+        self.assert_unconfirmed(self.request_success())
 
     def test_anonymous_paid_session_updates_only_matching_payment_status(self):
         self.assert_confirmed(self.request_success())
