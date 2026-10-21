@@ -58,7 +58,7 @@ class PaymentViewSet(
             })
 
         payment = get_object_or_404(
-            Payment, session_id=session_id, type=Payment.Type.PAYMENT,
+            Payment, session_id=session_id,
         )
         if payment.status == Payment.Status.PAID:
             return Response({

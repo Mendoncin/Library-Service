@@ -24,6 +24,7 @@ load_dotenv(BASE_DIR / '.env')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+FINE_MULTIPLIER = 2
 
 CELERY_BROKER_URL = os.environ.get(
     'CELERY_BROKER_URL',
