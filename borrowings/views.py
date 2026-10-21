@@ -13,7 +13,16 @@ from borrowings.models import Borrowing
 from borrowings.serializers import BorrowingCreateSerializer, BorrowingSerializer
 from notifications.services import notify_borrowing_created
 from payments.models import Payment
-from payments.services import create_checkout_session, create_payment_for_borrowing
+from payments.services import (
+    STRIPE_MIN_AMOUNT,
+    calculate_fine_amount,
+    calculate_overdue_days,
+    convert_to_stripe_amount,
+    create_checkout_session,
+    create_fine_checkout_session,
+    create_fine_payment,
+    create_payment_for_borrowing,
+)
 
 
 class BorrowingViewSet(
@@ -61,16 +70,16 @@ class BorrowingViewSet(
             return BorrowingCreateSerializer
         return super().get_serializer_class()
 
+    def _build_checkout_urls(self):
+        cancel_url = self.request.build_absolute_uri(reverse('payment-cancel'))
+        success_base_url = self.request.build_absolute_uri(reverse('payment-success'))
+        success_url = success_base_url + '?session_id={CHECKOUT_SESSION_ID}'
+        return success_url, cancel_url
+
     def perform_create(self, serializer):
         with transaction.atomic():
             borrowing = serializer.save(user=self.request.user)
-            cancel_url = self.request.build_absolute_uri(
-                reverse('payment-cancel'),
-            )
-            success_base_url = self.request.build_absolute_uri(
-                reverse('payment-success'),
-            )
-            success_url = success_base_url + '?session_id={CHECKOUT_SESSION_ID}'
+            success_url, cancel_url = self._build_checkout_urls()
             session = create_checkout_session(
                 borrowing, success_url=success_url, cancel_url=cancel_url,
             )
@@ -86,6 +95,9 @@ class BorrowingViewSet(
     def return_borrowing(self, request, pk=None):
         borrowing = self.get_object()
         today = timezone.localdate()
+        fine_amount = None
+        if calculate_overdue_days(borrowing, today) > 0:
+            fine_amount = calculate_fine_amount(borrowing, today)
 
         with transaction.atomic():
             updated = Borrowing.objects.filter(
@@ -99,6 +111,16 @@ class BorrowingViewSet(
                 )
 
             Book.objects.filter(pk=borrowing.book_id).update(inventory=F('inventory') + 1)
+
+            if fine_amount is not None:
+                session = None
+                if convert_to_stripe_amount(fine_amount) >= STRIPE_MIN_AMOUNT:
+                    success_url, cancel_url = self._build_checkout_urls()
+                    session = create_fine_checkout_session(
+                        borrowing, fine_amount,
+                        success_url=success_url, cancel_url=cancel_url,
+                    )
+                create_fine_payment(borrowing, fine_amount, session)
 
         borrowing = self.get_queryset().get(pk=borrowing.pk)
         serializer = self.get_serializer(borrowing)
