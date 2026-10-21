@@ -11,6 +11,13 @@ from payments.serializers import PaymentSerializer
 from payments.services import retrieve_checkout_session
 
 
+CANCEL_MESSAGE = (
+    'Payment was not completed. You can still pay later using the same '
+    'checkout link while the Stripe Checkout Session remains active; '
+    'sessions expire after a limited time.'
+)
+
+
 class PaymentViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -25,6 +32,16 @@ class PaymentViewSet(
         if not self.request.user.is_staff:
             queryset = queryset.filter(borrowing__user=self.request.user)
         return queryset
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='cancel',
+        url_name='cancel',
+        permission_classes=[AllowAny],
+    )
+    def cancel(self, request):
+        return Response({'detail': CANCEL_MESSAGE})
 
     @action(
         detail=False,

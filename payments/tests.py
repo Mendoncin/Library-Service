@@ -265,6 +265,89 @@ class PaymentSuccessTests(APITestCase):
         self.assert_state()
 
 
+@override_settings(STRIPE_SECRET_KEY='sk_test_fake')
+class PaymentCancelTests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = get_user_model().objects.create_user(email='cancel@example.com')
+        book = Book.objects.create(
+            title='Book', author='Author', cover=Book.Cover.HARD,
+            inventory=2, daily_fee=Decimal('2.50'),
+        )
+        borrowing = Borrowing.objects.create(
+            user=cls.user, book=book, borrow_date=date(2026, 10, 20),
+            expected_return_date=date(2026, 10, 25),
+        )
+        Payment.objects.create(
+            borrowing=borrowing, type=Payment.Type.PAYMENT,
+            money_to_pay=Decimal('12.50'), session_id='cs_test_cancel',
+            session_url='https://checkout.stripe.com/c/pay/cs_test_cancel',
+        )
+
+    def setUp(self):
+        self.url = reverse('payment-cancel')
+        self.expected_body = {
+            'detail': (
+                'Payment was not completed. You can still pay later using the same '
+                'checkout link while the Stripe Checkout Session remains active; '
+                'sessions expire after a limited time.'
+            ),
+        }
+        self.external_calls = []
+        for target in (
+            'payments.services.stripe.checkout.Session.retrieve',
+            'payments.services.stripe.checkout.Session.create',
+            'payments.services.stripe.checkout.Session.expire',
+            'notifications.services.send_telegram_message',
+        ):
+            patcher = patch(target)
+            self.external_calls.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        self.payments_before = list(Payment.objects.order_by('pk').values())
+        self.borrowings_before = list(Borrowing.objects.order_by('pk').values())
+        self.books_before = list(Book.objects.order_by('pk').values())
+
+    def assert_no_side_effects(self):
+        self.assertEqual(list(Payment.objects.order_by('pk').values()), self.payments_before)
+        self.assertEqual(list(Borrowing.objects.order_by('pk').values()), self.borrowings_before)
+        self.assertEqual(list(Book.objects.order_by('pk').values()), self.books_before)
+        for mock in self.external_calls:
+            mock.assert_not_called()
+
+    def test_anonymous_repeated_cancel_is_informative_without_queries_or_side_effects(self):
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertNumQueries(0):
+                first = self.client.get(self.url)
+                second = self.client.get(self.url)
+        self.assertEqual(callbacks, [])
+        for response in (first, second):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), self.expected_body)
+        self.assert_no_side_effects()
+
+    def test_authenticated_cancel_is_informative_without_queries_or_side_effects(self):
+        self.client.force_authenticate(user=self.user)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertNumQueries(0):
+                response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), self.expected_body)
+        self.assertEqual(callbacks, [])
+        self.assert_no_side_effects()
+
+    def test_cancel_write_methods_are_not_allowed(self):
+        for user in (None, self.user):
+            self.client.force_authenticate(user=user)
+            for method in ('post', 'put', 'patch', 'delete'):
+                with self.subTest(authenticated=user is not None, method=method):
+                    with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                        with self.assertNumQueries(0):
+                            response = getattr(self.client, method)(self.url)
+                    self.assertEqual(response.status_code, 405)
+                    self.assertEqual(callbacks, [])
+                    self.assert_no_side_effects()
+
+
 class BorrowingPriceTests(SimpleTestCase):
     def setUp(self):
         self.borrowing = Borrowing(
@@ -792,12 +875,16 @@ class PaymentAPITests(APITestCase):
         self.assertEqual(self.detail_url, f'/payments/{self.payment_a.pk}/')
         success_url = reverse('payment-success')
         self.assertEqual(success_url, '/payments/success/')
-        self.assertEqual(len(urlpatterns), 3)
+        cancel_url = reverse('payment-cancel')
+        self.assertEqual(cancel_url, '/payments/cancel/')
+        self.assertEqual(resolve(cancel_url).url_name, 'payment-cancel')
+        self.assertEqual(resolve(cancel_url).kwargs, {})
+        self.assertEqual(len(urlpatterns), 4)
         self.assertEqual([pattern.name for pattern in urlpatterns], [
-            'payment-list', 'payment-success', 'payment-detail',
+            'payment-list', 'payment-cancel', 'payment-success', 'payment-detail',
         ])
         for url, action in (
-            (self.list_url, 'list'), (success_url, 'success'),
+            (self.list_url, 'list'), (cancel_url, 'cancel'), (success_url, 'success'),
             (self.detail_url, 'retrieve'),
         ):
             with self.subTest(url=url):
