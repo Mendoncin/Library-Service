@@ -2,7 +2,11 @@ from django.db import transaction
 from django.db.models import F, Prefetch
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework import mixins, status, viewsets
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view, inline_serializer,
+)
+from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
@@ -25,6 +29,35 @@ from payments.services import (
 )
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List visible borrowings',
+        description=(
+            'Authentication is required. Regular users see only their own borrowings; '
+            'staff can see all borrowings. These filters apply only to this list endpoint.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                'is_active', OpenApiTypes.BOOL, OpenApiParameter.QUERY,
+                description=(
+                    "Accepts 'true' (not returned) or 'false' (returned), case-insensitively. "
+                    'Absent or empty means no active-status filter. Any other nonempty '
+                    'value returns HTTP 400; whitespace is not trimmed.'
+                ),
+            ),
+            OpenApiParameter(
+                'user_id', OpenApiTypes.INT64, OpenApiParameter.QUERY,
+                description=(
+                    'Staff only: filter by a positive user ID from 1 to 9223372036854775807. '
+                    'Use ASCII digits; leading zeroes are accepted, signs and whitespace are not. '
+                    'Absent or empty means no user filter; invalid nonempty values return HTTP 400. '
+                    'An unknown valid ID returns an empty list. Ignored for regular users, '
+                    'who always see only their own borrowings.'
+                ),
+            ),
+        ],
+    ),
+)
 class BorrowingViewSet(
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
@@ -86,6 +119,29 @@ class BorrowingViewSet(
             create_payment_for_borrowing(borrowing, session)
             transaction.on_commit(lambda: notify_borrowing_created(borrowing))
 
+    @extend_schema(
+        summary='Return a borrowed book',
+        description=(
+            'Authentication is required. Regular users may return only their own borrowings; '
+            'staff may return any borrowing. The server sets actual_return_date to today '
+            'and restores one inventory unit. A late return creates a FINE payment, with a '
+            'Stripe Checkout Session when the amount meets the USD 0.50 minimum. '
+            'List filters do not apply here.'
+        ),
+        request=None,
+        responses={
+            200: BorrowingSerializer,
+            401: OpenApiResponse(description='Authentication credentials missing or invalid.'),
+            404: OpenApiResponse(description='Borrowing does not exist or is not visible to this user.'),
+            409: OpenApiResponse(
+                response=inline_serializer(
+                    name='BorrowingReturnError',
+                    fields={'detail': serializers.CharField()},
+                ),
+                description='This borrowing has already been returned.',
+            ),
+        },
+    )
     @action(
         detail=True,
         methods=['post'],
