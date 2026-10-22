@@ -17,3 +17,7 @@ db.sqlite3
 .idea/
 # Celery Beat
 celerybeat-schedule*
+
+# Coverage
+.coverage
+htmlcov/

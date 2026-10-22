@@ -29,3 +29,5 @@ six==1.17.0
 redis==6.4.0
 stripe==16.0.0
 psycopg[binary]==3.3.6
+drf-spectacular==0.30.0
+coverage==7.16.2
